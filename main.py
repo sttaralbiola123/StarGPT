@@ -1,274 +1,685 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
 import os
-import io
 import re
 import time
-from collections import defaultdict
-from groq import Groq
-from flask import Flask
+import asyncio
+import datetime
 from threading import Thread
+from collections import defaultdict
 
-# ==========================================
-# 1. KEEP-ALIVE WEB SERVER (FOR RENDER)
-# ==========================================
+import discord
+import aiosqlite
+
+from flask import Flask
+from groq import Groq
+from discord.ext import commands
+from discord import app_commands
+
+# ==================================================
+# WEB SERVER
+# ==================================================
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "StarGPT is running flawlessly!"
+    return "StarGPT AI Moderation Online"
 
-def run_server():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+def run_web():
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080))
+    )
 
-Thread(target=run_server, daemon=True).start()
+Thread(target=run_web, daemon=True).start()
 
-# ==========================================
-# 2. BOT CONFIGURATION & CORE SETUP
-# ==========================================
-DISCORD_TOKEN = os.environ.get("DISCORD")
-GROQ_API_KEY = os.environ.get("GROQ")
+# ==================================================
+# ENV
+# ==================================================
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True 
+# ==================================================
+# BOT
+# ==================================================
+intents = discord.Intents.all()
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
 
-# ==========================================
-# 3. AUTOMOD SETTINGS & CONFIG
-# ==========================================
-BAD_WORDS = ["badword1", "badword2", "idiot", "spam"]
-INVITE_REGEX = re.compile(r"(discord\.gg/|discord\.com/invite/)")
-ZALGO_REGEX = re.compile(r"[\u0300-\u036f\u0483-\u0489\u0610-\u0615\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]{4,}")
-URL_REGEX = re.compile(r"https?://[^\s]+")
-ALLOWED_DOMAINS = ["youtube.com", "youtu.be", "github.com", "tenor.com", "giphy.com"]
+# ==================================================
+# STORAGE
+# ==================================================
+warning_counts = defaultdict(int)
+setup_channels = {}
+join_tracker = defaultdict(list)
 
-UNICODE_REPLACEMENTS = {
-    '𝞪': 'a', '𝞫': 'b', '𝞬': 'c', '𝞭': 'd', '𝞮': 'e', '𝞯': 'f', 'а': 'a', 'е': 'e',
-    'о': 'o', 'р': 'p', 'х': 'x', 'ѕ': 's', 'і': 'i', '𝟢': '0', '𝟣': '1', '𝟤': '2'
-}
+# ==================================================
+# DATABASE
+# ==================================================
+async def setup_database():
 
-user_messages = defaultdict(list) 
-recent_joins = [] 
+    async with aiosqlite.connect("stargpt.db") as db:
 
-SPAM_LIMIT = 5        
-SPAM_TIME = 5         
-MENTION_LIMIT = 5     
-EMOJI_LIMIT = 10      
-RAID_LIMIT = 10       
-RAID_TIME = 10        
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS memory (
+            user_id INTEGER,
+            guild_id INTEGER,
+            role TEXT,
+            content TEXT
+        )
+        """)
 
-# ==========================================
-# 4. MEMORY & CONFIGURATION STORAGE
-# ==========================================
-ai_memory = defaultdict(list)
-MAX_MEMORY_LENGTH = 30 
-star_channels = {}
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id INTEGER PRIMARY KEY,
+            nickname TEXT,
+            language TEXT,
+            favorite_game TEXT
+        )
+        """)
 
-def clean_unicode_spoofing(text):
-    for spoofed, clean in UNICODE_REPLACEMENTS.items():
-        text = text.replace(spoofed, clean)
-    return text
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS appeals (
+            user_id INTEGER,
+            guild_id INTEGER,
+            reason TEXT
+        )
+        """)
 
-# ==========================================
-# 5. SLASH COMMANDS & REGULAR COMMANDS
-# ==========================================
-@bot.tree.command(name="setup", description="Piliin kung saang channel lang pwedeng mag-reply si StarGPT.")
-@app_commands.describe(channel="Ang channel kung saan pwedeng makipag-chat kay StarGPT")
-@app_commands.checks.has_permissions(administrator=True)
-async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
-    star_channels[interaction.guild_id] = channel.id
-    await interaction.response.send_message(f"✨ **StarGPT Setup Success!** Mula ngayon, pwede niyo na akong kausapin nang direkta sa {channel.mention} nang hindi na kailangang i-tag!")
+        await db.commit()
 
-@setup.error
-async def setup_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Paumanhin, tanging mga Server Administrator lamang ang pwedeng gumamit ng command na ito.", ephemeral=True)
+# ==================================================
+# AI CHAT
+# ==================================================
+SYSTEM_PROMPT = """
+You are StarGPT.
 
-@bot.command(name="clear")
-@commands.has_permissions(manage_messages=True)
-async def clear(ctx, amount: int):
-    await ctx.channel.purge(limit=amount + 1)
-    await ctx.send(f"🧹 Nabura na ang {amount} na mensahe!", delete_after=3)
+You are intelligent, friendly, safe,
+and helpful.
+"""
 
-@bot.command(name="reset")
-async def reset_memory(ctx):
-    channel_id = ctx.channel.id
-    if channel_id in ai_memory:
-        ai_memory[channel_id].clear()
-        await ctx.reply("🧠 **Memory Reset!** Nalimutan ko na ang mga huli nating pinag-usapan sa channel na ito.")
+async def generate_ai(messages):
+
+    def run():
+        return groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1000,
+        )
+
+    response = await asyncio.to_thread(run)
+
+    return response.choices[0].message.content
+
+# ==================================================
+# MEMORY
+# ==================================================
+async def save_memory(
+    user_id,
+    guild_id,
+    role,
+    content
+):
+
+    async with aiosqlite.connect("stargpt.db") as db:
+
+        await db.execute(
+            """
+            INSERT INTO memory
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                guild_id,
+                role,
+                content
+            )
+        )
+
+        await db.commit()
+
+async def load_memory(
+    user_id,
+    guild_id
+):
+
+    async with aiosqlite.connect("stargpt.db") as db:
+
+        cursor = await db.execute("""
+        SELECT role, content
+        FROM memory
+        WHERE user_id=? AND guild_id=?
+        ORDER BY rowid DESC
+        LIMIT 10
+        """, (
+            user_id,
+            guild_id
+        ))
+
+        rows = await cursor.fetchall()
+
+    rows.reverse()
+
+    memory = []
+
+    for role, content in rows:
+
+        memory.append({
+            "role": role,
+            "content": content
+        })
+
+    return memory
+
+# ==================================================
+# AI MODERATION
+# ==================================================
+async def ai_moderation(text):
+
+    def run():
+        return groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You are a moderation AI.
+
+Classify the message into ONLY ONE:
+
+SAFE
+SPAM
+SCAM
+TOXIC
+HARASSMENT
+EXTREME
+
+EXTREME includes:
+- severe harassment
+- hate speech
+- threats
+- dangerous scams
+"""
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ],
+            temperature=0
+        )
+
+    result = await asyncio.to_thread(run)
+
+    return result.choices[0].message.content.strip().upper()
+
+# ==================================================
+# AI APPEAL REVIEW
+# ==================================================
+async def ai_appeal_review(reason):
+
+    def run():
+        return groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You are an appeal review AI.
+
+Reply ONLY with:
+APPROVE
+DENY
+
+Approve if:
+- user appears honest
+- punishment was too harsh
+- accidental behavior
+
+Deny if:
+- repeated abuse
+- scams
+- severe toxicity
+"""
+                },
+                {
+                    "role": "user",
+                    "content": reason
+                }
+            ],
+            temperature=0
+        )
+
+    result = await asyncio.to_thread(run)
+
+    return result.choices[0].message.content.strip().upper()
+
+# ==================================================
+# STREAMING RESPONSE
+# ==================================================
+async def stream_response(
+    message,
+    response
+):
+
+    msg = await message.reply("Thinking...")
+
+    partial = ""
+
+    for word in response.split():
+
+        partial += word + " "
+
+        try:
+            await msg.edit(
+                content=partial[:1900]
+            )
+        except:
+            pass
+
+        await asyncio.sleep(0.03)
+
+# ==================================================
+# PUNISHMENT SYSTEM
+# ==================================================
+async def punish(member, category):
+
+    key = (
+        member.guild.id,
+        member.id
+    )
+
+    warning_counts[key] += 1
+
+    warnings = warning_counts[key]
+
+    if category == "SAFE":
+        return
+
+    elif category == "SPAM":
+        duration = 5
+
+    elif category == "TOXIC":
+        duration = 10
+
+    elif category == "HARASSMENT":
+        duration = 30
+
+    elif category == "SCAM":
+        duration = 60
+
+    elif category == "EXTREME":
+        duration = 1440
+
     else:
-        await ctx.reply("Malinis na ang memory sa channel na ito.", delete_after=5)
+        duration = 10
 
-# ==========================================
-# 6. AUTOMOD & SYSTEM EVENTS
-# ==========================================
+    try:
+        await member.timeout(
+            datetime.timedelta(minutes=duration),
+            reason=category
+        )
+    except:
+        pass
+
+    try:
+        await member.send(
+            f"""
+Moderation Action
+
+Category: {category}
+Warnings: {warnings}/3
+Timeout: {duration} minutes
+
+Use:
+/appeal your_reason
+"""
+        )
+    except:
+        pass
+
+# ==================================================
+# ANTI RAID
+# ==================================================
 @bot.event
 async def on_member_join(member):
-    global recent_joins
-    current_time = time.time()
-    recent_joins = [t for t in recent_joins if current_time - t < RAID_TIME]
-    recent_joins.append(current_time)
 
-    if len(recent_joins) >= RAID_LIMIT:
-        print(f"🚨 RAID DETECTED!")
+    guild_id = member.guild.id
 
-@bot.event
-async def on_ready():
-    try:
-        await bot.tree.sync()
-        print("✨ Synced slash commands successfully.")
-    except Exception as e:
-        print(f"Failed to sync commands: {e}")
-        
-    print(f'✅ Connected successfully! StarGPT Online.')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="your text channels ✨"))
+    join_tracker[guild_id].append(
+        time.time()
+    )
 
-# ==========================================
-# 7. CHAT LOGIC + HEAVY AUTOMOD CHECKER
-# ==========================================
+    recent = [
+        t for t in join_tracker[guild_id]
+        if time.time() - t < 15
+    ]
+
+    if len(recent) >= 10:
+
+        try:
+            await member.guild.edit(
+                verification_level=discord.VerificationLevel.high
+            )
+        except:
+            pass
+
+    account_age = (
+        discord.utils.utcnow()
+        - member.created_at
+    ).days
+
+    suspicious = False
+
+    if account_age < 7:
+        suspicious = True
+
+    if member.avatar is None:
+        suspicious = True
+
+    if suspicious:
+
+        try:
+            await member.timeout(
+                datetime.timedelta(minutes=30),
+                reason="Suspicious account"
+            )
+        except:
+            pass
+
+# ==================================================
+# SETUP COMMAND
+# ==================================================
+@bot.tree.command(name="setup")
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def setup(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel
+):
+
+    setup_channels[
+        interaction.guild.id
+    ] = channel.id
+
+    await interaction.response.send_message(
+        f"AI channel set to {channel.mention}"
+    )
+
+# ==================================================
+# REMEMBER COMMAND
+# ==================================================
+@bot.tree.command(name="remember")
+async def remember(
+    interaction: discord.Interaction,
+    key: str,
+    value: str
+):
+
+    async with aiosqlite.connect("stargpt.db") as db:
+
+        cursor = await db.execute("""
+        SELECT *
+        FROM profiles
+        WHERE user_id=?
+        """, (
+            interaction.user.id,
+        ))
+
+        exists = await cursor.fetchone()
+
+        if exists:
+
+            if key == "nickname":
+
+                await db.execute("""
+                UPDATE profiles
+                SET nickname=?
+                WHERE user_id=?
+                """, (
+                    value,
+                    interaction.user.id
+                ))
+
+            elif key == "language":
+
+                await db.execute("""
+                UPDATE profiles
+                SET language=?
+                WHERE user_id=?
+                """, (
+                    value,
+                    interaction.user.id
+                ))
+
+            elif key == "favorite_game":
+
+                await db.execute("""
+                UPDATE profiles
+                SET favorite_game=?
+                WHERE user_id=?
+                """, (
+                    value,
+                    interaction.user.id
+                ))
+
+        else:
+
+            await db.execute("""
+            INSERT INTO profiles
+            VALUES (?, ?, ?, ?)
+            """, (
+                interaction.user.id,
+                value if key == "nickname" else None,
+                value if key == "language" else None,
+                value if key == "favorite_game" else None,
+            ))
+
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"Saved {key}: {value}"
+    )
+
+# ==================================================
+# APPEAL COMMAND
+# ==================================================
+@bot.tree.command(name="appeal")
+async def appeal(
+    interaction: discord.Interaction,
+    reason: str
+):
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    decision = await ai_appeal_review(
+        reason
+    )
+
+    if decision == "APPROVE":
+
+        try:
+            await interaction.user.timeout(
+                None,
+                reason="AI approved appeal"
+            )
+        except:
+            pass
+
+        await interaction.followup.send(
+            "Your appeal was approved."
+        )
+
+    else:
+
+        await interaction.followup.send(
+            "Your appeal was denied."
+        )
+
+# ==================================================
+# MESSAGE EVENT
+# ==================================================
 @bot.event
 async def on_message(message):
+
     if message.author.bot:
-        return
-
-    content = message.content
-    content_lower = clean_unicode_spoofing(content.lower())
-    user_id = message.author.id
-    channel_id = message.channel.id
-    guild_id = message.guild.id if message.guild else None
-    current_time = time.time()
-
-    # --- AUTOMOD ---
-    if INVITE_REGEX.search(content_lower):
-        await message.delete()
-        await message.channel.send(f"⚠️ {message.author.mention}, server invites are banned!", delete_after=5)
-        return
-
-    found_urls = URL_REGEX.findall(content)
-    if found_urls:
-        for url in found_urls:
-            is_allowed = any(domain in url.lower() for domain in ALLOWED_DOMAINS)
-            if not is_allowed:
-                await message.delete()
-                await message.channel.send(f"⚠️ {message.author.mention}, links are restricted!", delete_after=5)
-                return
-
-    for word in BAD_WORDS:
-        if word in content_lower:
-            await message.delete()
-            await message.channel.send(f"⚠️ {message.author.mention}, watch your language!", delete_after=5)
-            return
-
-    if len(content) > 15:
-        caps_count = sum(1 for c in content if c.isupper())
-        if caps_count / len(content) > 0.7:
-            await message.delete()
-            await message.channel.send(f"⚠️ {message.author.mention}, don't use ALL CAPS.", delete_after=5)
-            return
-
-    if len(message.mentions) > MENTION_LIMIT:
-        await message.delete()
-        await message.channel.send(f"⚠️ {message.author.mention}, no mass mentions!", delete_after=5)
-        return
-
-    if len(re.findall(r'<a?:\w+:\d+>', content)) > EMOJI_LIMIT:
-        await message.delete()
-        await message.channel.send(f"⚠️ {message.author.mention}, stop spamming emojis!", delete_after=5)
-        return
-
-    if ZALGO_REGEX.search(content):
-        await message.delete()
-        await message.channel.send(f"⚠️ {message.author.mention}, zalgo text detected.", delete_after=5)
-        return
-
-    user_messages[user_id].append({"time": current_time, "content": content_lower})
-    user_messages[user_id] = [msg for msg in user_messages[user_id] if current_time - msg["time"] < SPAM_TIME]
-    
-    if len(user_messages[user_id]) >= SPAM_LIMIT:
-        await message.delete()
-        await message.channel.send(f"🛑 {message.author.mention}, stop flooding the chat!", delete_after=5)
-        return
-    
-    if len(user_messages[user_id]) >= 3:
-        if user_messages[user_id][-1]["content"] == user_messages[user_id][-2]["content"] == user_messages[user_id][-3]["content"]:
-            await message.delete()
-            await message.channel.send(f"🛑 {message.author.mention}, stop repeating yourself!", delete_after=5)
-            return
-
-    # --- AI CHAT ENGINE (MULTILINGUAL MATCH) ---
-    allowed_channel_id = star_channels.get(guild_id)
-    should_respond = False
-
-    if allowed_channel_id and channel_id == allowed_channel_id:
-        should_respond = True
-    elif bot.user in message.mentions:
-        if allowed_channel_id and channel_id != allowed_channel_id:
-            await message.reply(f"🔒 **StarGPT Locked:** Pwede mo lang akong kausapin sa channel na ito: <#{allowed_channel_id}>", delete_after=8)
-            return
-        should_respond = True
-
-    if should_respond:
-        clean_prompt = message.content.replace(f'<@{bot.user.id}>', '').strip()
-        
-        if not clean_prompt:
-            if bot.user in message.mentions:
-                await message.channel.send("Mabuhay! I-type mo lang ang tanong mo dito sa channel na ito at sasagutin kita agad!")
-            return
-
-        async with message.channel.typing():
-            try:
-                ai_memory[channel_id].append({"role": "user", "content": clean_prompt})
-
-                if len(ai_memory[channel_id]) > MAX_MEMORY_LENGTH:
-                    ai_memory[channel_id] = ai_memory[channel_id][-MAX_MEMORY_LENGTH:]
-
-                # UPDATED: Sasagot na siya depende sa kung anong gamit na wika ng user (Dynamic Multilingual)
-                system_prompt = {
-                    "role": "system",
-                    "content": (
-                        "You are StarGPT, a highly advanced and versatile AI assistant. "
-                        "DYNAMIC LANGUAGE RULE: You must automatically match the language and style of the user. "
-                        "If they talk to you in English, respond in English. If they use Tagalog, respond in Tagalog. "
-                        "If they talk in Taglish, comfortably reply in Taglish. Be conversational, direct, and completely fluid."
-                    )
-                }
-                
-                full_conversation_payload = [system_prompt] + ai_memory[channel_id]
-
-                chat_completion = groq_client.chat.completions.create(
-                    messages=full_conversation_payload,
-                    model="llama-3.1-8b-instant", 
-                    max_tokens=3500,
-                    temperature=0.7
-                )
-                
-                reply = chat_completion.choices[0].message.content
-                ai_memory[channel_id].append({"role": "assistant", "content": reply})
-
-                if len(reply) > 2000:
-                    file_stream = io.BytesIO(reply.encode('utf-8'))
-                    discord_file = discord.File(fp=file_stream, filename="stargpt_response.txt")
-                    await message.reply("📝 Sobrang haba ng response ko, nilagay ko muna sa file na ito:", file=discord_file)
-                else:
-                    await message.reply(reply)
-
-            except Exception as e:
-                print(f"StarGPT Error: {e}")
-                await message.reply("❌ May kaunting aberya ang system ko. Pakisuyong ulitin!")
         return
 
     await bot.process_commands(message)
 
-# ==========================================
-# 8. EXECUTOR
-# ==========================================
-if __name__ == "__main__":
-    if not DISCORD_TOKEN or not GROQ_API_KEY:
-        print("❌ Environment variables are missing.")
-    else:
-        bot.run(DISCORD_TOKEN)
+    if not message.guild:
+        return
+
+    allowed_channel = setup_channels.get(
+        message.guild.id
+    )
+
+    # Channel Lock
+    if allowed_channel:
+
+        if (
+            message.channel.id != allowed_channel
+            and bot.user in message.mentions
+        ):
+
+            await message.reply(
+                f"Use <#{allowed_channel}> for AI chat."
+            )
+
+            return
+
+    # AI Moderation
+    moderation_result = await ai_moderation(
+        message.content
+    )
+
+    if moderation_result != "SAFE":
+
+        try:
+            await message.delete()
+        except:
+            pass
+
+        await punish(
+            message.author,
+            moderation_result
+        )
+
+        return
+
+    # AI Chat
+    if (
+        bot.user in message.mentions
+        or (
+            allowed_channel
+            and message.channel.id == allowed_channel
+        )
+    ):
+
+        prompt = message.content
+
+        if bot.user in message.mentions:
+
+            prompt = re.sub(
+                rf"<@!?{bot.user.id}>",
+                "",
+                prompt
+            ).strip()
+
+        profile_text = ""
+
+        async with aiosqlite.connect(
+            "stargpt.db"
+        ) as db:
+
+            cursor = await db.execute("""
+            SELECT nickname,
+            language,
+            favorite_game
+            FROM profiles
+            WHERE user_id=?
+            """, (
+                message.author.id,
+            ))
+
+            profile = await cursor.fetchone()
+
+        if profile:
+
+            nickname, language, favorite_game = profile
+
+            profile_text = f'''
+Nickname: {nickname}
+Language: {language}
+Favorite Game: {favorite_game}
+'''
+
+        memory = await load_memory(
+            message.author.id,
+            message.guild.id
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content":
+                SYSTEM_PROMPT + "\n" + profile_text
+            }
+        ]
+
+        messages.extend(memory)
+
+        messages.append({
+            "role": "user",
+            "content": prompt
+        })
+
+        response = await generate_ai(
+            messages
+        )
+
+        await save_memory(
+            message.author.id,
+            message.guild.id,
+            "user",
+            prompt
+        )
+
+        await save_memory(
+            message.author.id,
+            message.guild.id,
+            "assistant",
+            response
+        )
+
+        await stream_response(
+            message,
+            response
+        )
+
+# ==================================================
+# READY EVENT
+# ==================================================
+@bot.event
+async def on_ready():
+
+    await setup_database()
+
+    try:
+        await bot.tree.sync()
+    except Exception as e:
+        print(e)
+
+    print(f"Logged in as {bot.user}")
+
+# ==================================================
+# START BOT
+# ==================================================
+bot.run(DISCORD_TOKEN)
