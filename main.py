@@ -75,20 +75,18 @@ def clean_unicode_spoofing(text):
     return text
 
 # ==========================================
-# 5. SLASH COMMANDS & REGULAR COMMANDS (FIXED!)
+# 5. SLASH COMMANDS & REGULAR COMMANDS
 # ==========================================
 @bot.tree.command(name="setup", description="Piliin kung saang channel lang pwedeng mag-reply si StarGPT.")
 @app_commands.describe(channel="Ang channel kung saan pwedeng makipag-chat kay StarGPT")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
     star_channels[interaction.guild_id] = channel.id
-    # FIXED: Binago mula send_content tungo sa send_message
-    await interaction.response.send_message(f"✨ **StarGPT Setup Success!** Mula ngayon, sa channel na {channel.mention} lang ako sasagot sa mga chat ninyo.")
+    await interaction.response.send_message(f"✨ **StarGPT Setup Success!** Mula ngayon, pwede niyo na akong kausapin nang direkta sa {channel.mention} nang hindi na kailangang i-tag!")
 
 @setup.error
 async def setup_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
-        # FIXED: Binago rin dito
         await interaction.response.send_message("❌ Paumanhin, tanging mga Server Administrator lamang ang pwedeng gumamit ng command na ito.", ephemeral=True)
 
 @bot.command(name="clear")
@@ -102,7 +100,7 @@ async def reset_memory(ctx):
     channel_id = ctx.channel.id
     if channel_id in ai_memory:
         ai_memory[channel_id].clear()
-        await ctx.reply("🧠 **Memory Reset!** Nalimutan ko na ang mga pinag-usapan natin dito.")
+        await ctx.reply("🧠 **Memory Reset!** Nalimutan ko na ang mga huli nating pinag-usapan sa channel na ito.")
     else:
         await ctx.reply("Malinis na ang memory sa channel na ito.", delete_after=5)
 
@@ -128,7 +126,7 @@ async def on_ready():
         print(f"Failed to sync commands: {e}")
         
     print(f'✅ Connected successfully! StarGPT Online.')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="your mentions ✨"))
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="your text channels ✨"))
 
 # ==========================================
 # 7. CHAT LOGIC + HEAVY AUTOMOD CHECKER
@@ -202,16 +200,24 @@ async def on_message(message):
             await message.channel.send(f"🛑 {message.author.mention}, stop repeating yourself!", delete_after=5)
             return
 
-    # --- AI CHAT ENGINE ---
-    if bot.user in message.mentions:
-        allowed_channel_id = star_channels.get(guild_id)
-        if allowed_channel_id and channel_id != allowed_channel_id:
-            await message.reply(f"🔒 **StarGPT Locked:** Pwede mo lang akong kausapin sa <#{allowed_channel_id}>", delete_after=8)
-            return
+    # --- AI CHAT ENGINE (MULTILINGUAL MATCH) ---
+    allowed_channel_id = star_channels.get(guild_id)
+    should_respond = False
 
+    if allowed_channel_id and channel_id == allowed_channel_id:
+        should_respond = True
+    elif bot.user in message.mentions:
+        if allowed_channel_id and channel_id != allowed_channel_id:
+            await message.reply(f"🔒 **StarGPT Locked:** Pwede mo lang akong kausapin sa channel na ito: <#{allowed_channel_id}>", delete_after=8)
+            return
+        should_respond = True
+
+    if should_respond:
         clean_prompt = message.content.replace(f'<@{bot.user.id}>', '').strip()
+        
         if not clean_prompt:
-            await message.channel.send("Hey there! Mention me along with a prompt!")
+            if bot.user in message.mentions:
+                await message.channel.send("Mabuhay! I-type mo lang ang tanong mo dito sa channel na ito at sasagutin kita agad!")
             return
 
         async with message.channel.typing():
@@ -221,9 +227,15 @@ async def on_message(message):
                 if len(ai_memory[channel_id]) > MAX_MEMORY_LENGTH:
                     ai_memory[channel_id] = ai_memory[channel_id][-MAX_MEMORY_LENGTH:]
 
+                # UPDATED: Sasagot na siya depende sa kung anong gamit na wika ng user (Dynamic Multilingual)
                 system_prompt = {
                     "role": "system",
-                    "content": "You are StarGPT, a helpful Discord AI. Speak fluently in English, Tagalog, or Taglish."
+                    "content": (
+                        "You are StarGPT, a highly advanced and versatile AI assistant. "
+                        "DYNAMIC LANGUAGE RULE: You must automatically match the language and style of the user. "
+                        "If they talk to you in English, respond in English. If they use Tagalog, respond in Tagalog. "
+                        "If they talk in Taglish, comfortably reply in Taglish. Be conversational, direct, and completely fluid."
+                    )
                 }
                 
                 full_conversation_payload = [system_prompt] + ai_memory[channel_id]
@@ -241,13 +253,14 @@ async def on_message(message):
                 if len(reply) > 2000:
                     file_stream = io.BytesIO(reply.encode('utf-8'))
                     discord_file = discord.File(fp=file_stream, filename="stargpt_response.txt")
-                    await message.reply("📝 Response is too long, here is the file:", file=discord_file)
+                    await message.reply("📝 Sobrang haba ng response ko, nilagay ko muna sa file na ito:", file=discord_file)
                 else:
                     await message.reply(reply)
 
             except Exception as e:
                 print(f"StarGPT Error: {e}")
-                await message.reply("❌ Encountered an error, try again!")
+                await message.reply("❌ May kaunting aberya ang system ko. Pakisuyong ulitin!")
+        return
 
     await bot.process_commands(message)
 
