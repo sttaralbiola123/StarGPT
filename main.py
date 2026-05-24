@@ -17,7 +17,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "StarGPT Ultra with Slash Setup and Advanced AutoMod is Live!"
+    return "StarGPT is running flawlessly!"
 
 def run_server():
     port = int(os.environ.get("PORT", 8080))
@@ -39,17 +39,14 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
-# 3. ADVANCED AUTOMOD SETTINGS & CONFIG
+# 3. AUTOMOD SETTINGS & CONFIG
 # ==========================================
 BAD_WORDS = ["badword1", "badword2", "idiot", "spam"]
 INVITE_REGEX = re.compile(r"(discord\.gg/|discord\.com/invite/)")
 ZALGO_REGEX = re.compile(r"[\u0300-\u036f\u0483-\u0489\u0610-\u0615\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]{4,}")
-
-# NEW: Anti-Link configuration (Blocks general links but allows safe ones)
 URL_REGEX = re.compile(r"https?://[^\s]+")
 ALLOWED_DOMAINS = ["youtube.com", "youtu.be", "github.com", "tenor.com", "giphy.com"]
 
-# NEW: Lookalike character translation mapping (Anti-bypass word filter)
 UNICODE_REPLACEMENTS = {
     '𝞪': 'a', '𝞫': 'b', '𝞬': 'c', '𝞭': 'd', '𝞮': 'e', '𝞯': 'f', 'а': 'a', 'е': 'e',
     'о': 'o', 'р': 'p', 'х': 'x', 'ѕ': 's', 'і': 'i', '𝟢': '0', '𝟣': '1', '𝟤': '2'
@@ -58,7 +55,6 @@ UNICODE_REPLACEMENTS = {
 user_messages = defaultdict(list) 
 recent_joins = [] 
 
-# AutoMod Limits
 SPAM_LIMIT = 5        
 SPAM_TIME = 5         
 MENTION_LIMIT = 5     
@@ -71,53 +67,47 @@ RAID_TIME = 10
 # ==========================================
 ai_memory = defaultdict(list)
 MAX_MEMORY_LENGTH = 30 
-
-# Dynamic AI Channel Binding Config: { guild_id: channel_id }
-# Kung anong channel ang i-setup mo rito, doon lang papayagang sumagot ang AI
 star_channels = {}
 
 def clean_unicode_spoofing(text):
-    """Translates lookalike characters back to standard text to catch bypassed words"""
     for spoofed, clean in UNICODE_REPLACEMENTS.items():
         text = text.replace(spoofed, clean)
     return text
 
 # ==========================================
-# 5. SLASH COMMANDS & REGULAR COMMANDS
+# 5. SLASH COMMANDS & REGULAR COMMANDS (FIXED!)
 # ==========================================
-@bot.tree.command(name="setup", description="Piliin kung saang channel lang pwedeng mag-reply si StarGPT sa server na ito.")
+@bot.tree.command(name="setup", description="Piliin kung saang channel lang pwedeng mag-reply si StarGPT.")
 @app_commands.describe(channel="Ang channel kung saan pwedeng makipag-chat kay StarGPT")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
     star_channels[interaction.guild_id] = channel.id
-    await interaction.response.send_content(f"✨ **StarGPT Setup Success!** Mula ngayon, sa channel na {channel.mention} lang ako sasagot sa mga chat ninyo.")
+    # FIXED: Binago mula send_content tungo sa send_message
+    await interaction.response.send_message(f"✨ **StarGPT Setup Success!** Mula ngayon, sa channel na {channel.mention} lang ako sasagot sa mga chat ninyo.")
 
 @setup.error
 async def setup_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_content("❌ Paumanhin, tanging mga Server Administrator lamang ang pwedeng gumamit ng command na ito.", ephemeral=True)
+        # FIXED: Binago rin dito
+        await interaction.response.send_message("❌ Paumanhin, tanging mga Server Administrator lamang ang pwedeng gumamit ng command na ito.", ephemeral=True)
 
-# Moderation Command: !clear
 @bot.command(name="clear")
 @commands.has_permissions(manage_messages=True)
 async def clear(ctx, amount: int):
-    """Mabilisang pagbura ng mensahe (e.g., !clear 50)"""
     await ctx.channel.purge(limit=amount + 1)
     await ctx.send(f"🧹 Nabura na ang {amount} na mensahe!", delete_after=3)
 
-# AI Command: !reset
 @bot.command(name="reset")
 async def reset_memory(ctx):
-    """Nililinis ang AI memory ng kasalukuyang channel"""
     channel_id = ctx.channel.id
     if channel_id in ai_memory:
         ai_memory[channel_id].clear()
-        await ctx.reply("🧠 **Memory Reset!** Nalimutan ko na ang mga huli nating pinag-usapan sa channel na ito. Pwede na tayong magsimula ng bagong topic.")
+        await ctx.reply("🧠 **Memory Reset!** Nalimutan ko na ang mga pinag-usapan natin dito.")
     else:
-        await ctx.reply("Ang memory sa channel na ito ay malinis na.", delete_after=5)
+        await ctx.reply("Malinis na ang memory sa channel na ito.", delete_after=5)
 
 # ==========================================
-# 6. AUTOMOD & ANTI-RAID SYSTEM EVENTS
+# 6. AUTOMOD & SYSTEM EVENTS
 # ==========================================
 @bot.event
 async def on_member_join(member):
@@ -127,18 +117,17 @@ async def on_member_join(member):
     recent_joins.append(current_time)
 
     if len(recent_joins) >= RAID_LIMIT:
-        print(f"🚨 RAID DETECTED! StarGPT AutoMod defending.")
+        print(f"🚨 RAID DETECTED!")
 
 @bot.event
 async def on_ready():
-    # Sync ang slash command sa Discord API servers
     try:
-        synced = await bot.tree.sync()
-        print(f"✨ Synced {len(synced)} slash commands.")
+        await bot.tree.sync()
+        print("✨ Synced slash commands successfully.")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
         
-    print(f'✅ Connected successfully! StarGPT Engine is Online.')
+    print(f'✅ Connected successfully! StarGPT Online.')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="your mentions ✨"))
 
 # ==========================================
@@ -150,65 +139,55 @@ async def on_message(message):
         return
 
     content = message.content
-    # Clean standard bypass text formatting tricks
     content_lower = clean_unicode_spoofing(content.lower())
     user_id = message.author.id
     channel_id = message.channel.id
     guild_id = message.guild.id if message.guild else None
     current_time = time.time()
 
-    # --- PART A: ADVANCED AUTOMOD ---
-    
-    # 1. Anti-Invite
+    # --- AUTOMOD ---
     if INVITE_REGEX.search(content_lower):
         await message.delete()
-        await message.channel.send(f"⚠️ {message.author.mention}, server invites are banned here!", delete_after=5)
+        await message.channel.send(f"⚠️ {message.author.mention}, server invites are banned!", delete_after=5)
         return
 
-    # 2. Anti-Link Protection (With Allowed Safelist domains)
     found_urls = URL_REGEX.findall(content)
     if found_urls:
         for url in found_urls:
             is_allowed = any(domain in url.lower() for domain in ALLOWED_DOMAINS)
             if not is_allowed:
                 await message.delete()
-                await message.channel.send(f"⚠️ {message.author.mention}, links/URLs are restricted to trusted websites only!", delete_after=5)
+                await message.channel.send(f"⚠️ {message.author.mention}, links are restricted!", delete_after=5)
                 return
 
-    # 3. Word Filter
     for word in BAD_WORDS:
         if word in content_lower:
             await message.delete()
             await message.channel.send(f"⚠️ {message.author.mention}, watch your language!", delete_after=5)
             return
 
-    # 4. Anti-Caps 
     if len(content) > 15:
         caps_count = sum(1 for c in content if c.isupper())
         if caps_count / len(content) > 0.7:
             await message.delete()
-            await message.channel.send(f"⚠️ {message.author.mention}, please lower your voice (Too many Caps).", delete_after=5)
+            await message.channel.send(f"⚠️ {message.author.mention}, don't use ALL CAPS.", delete_after=5)
             return
 
-    # 5. Anti-Mention Spam
     if len(message.mentions) > MENTION_LIMIT:
         await message.delete()
-        await message.channel.send(f"⚠️ {message.author.mention}, mass mentions are not allowed!", delete_after=5)
+        await message.channel.send(f"⚠️ {message.author.mention}, no mass mentions!", delete_after=5)
         return
 
-    # 6. Anti-Emoji Spam
     if len(re.findall(r'<a?:\w+:\d+>', content)) > EMOJI_LIMIT:
         await message.delete()
-        await message.channel.send(f"⚠️ {message.author.mention}, please stop spamming emojis!", delete_after=5)
+        await message.channel.send(f"⚠️ {message.author.mention}, stop spamming emojis!", delete_after=5)
         return
 
-    # 7. Anti-Zalgo Text
     if ZALGO_REGEX.search(content):
         await message.delete()
-        await message.channel.send(f"⚠️ {message.author.mention}, corrupted/zalgo text detected.", delete_after=5)
+        await message.channel.send(f"⚠️ {message.author.mention}, zalgo text detected.", delete_after=5)
         return
 
-    # 8. Anti-Spam / Flood Tracking
     user_messages[user_id].append({"time": current_time, "content": content_lower})
     user_messages[user_id] = [msg for msg in user_messages[user_id] if current_time - msg["time"] < SPAM_TIME]
     
@@ -223,20 +202,16 @@ async def on_message(message):
             await message.channel.send(f"🛑 {message.author.mention}, stop repeating yourself!", delete_after=5)
             return
 
-    # --- PART B: BINDED STARGPT CHAT ENGINE ---
+    # --- AI CHAT ENGINE ---
     if bot.user in message.mentions:
-        # Check kung na-setup na ang channel para sa server na ito
         allowed_channel_id = star_channels.get(guild_id)
-        
-        # Kung may na-setup na, at hindi ito ang tamang channel, iba-block ng bot ang response
         if allowed_channel_id and channel_id != allowed_channel_id:
-            await message.reply(f"🔒 **StarGPT Access Locked:** Maaari niyo lamang akong kausapin sa itinalagang channel na ito: <#{allowed_channel_id}>", delete_after=8)
+            await message.reply(f"🔒 **StarGPT Locked:** Pwede mo lang akong kausapin sa <#{allowed_channel_id}>", delete_after=8)
             return
 
         clean_prompt = message.content.replace(f'<@{bot.user.id}>', '').strip()
-        
         if not clean_prompt:
-            await message.channel.send("Hey there! Mention me along with a prompt, and I'll remember our conversation just like ChatGPT!")
+            await message.channel.send("Hey there! Mention me along with a prompt!")
             return
 
         async with message.channel.typing():
@@ -248,12 +223,7 @@ async def on_message(message):
 
                 system_prompt = {
                     "role": "system",
-                    "content": (
-                        "You are StarGPT, a highly capable and intelligent AI assistant and advanced server moderator. "
-                        "You process deep technical logic, write flawless code, create engaging stories, "
-                        "and think with high-level reasoning. Keep your formatting beautiful and clean using bolding and structures. "
-                        "You are conversational and helpful, speaking fluently in English, Tagalog, or Taglish."
-                    )
+                    "content": "You are StarGPT, a helpful Discord AI. Speak fluently in English, Tagalog, or Taglish."
                 }
                 
                 full_conversation_payload = [system_prompt] + ai_memory[channel_id]
@@ -271,13 +241,21 @@ async def on_message(message):
                 if len(reply) > 2000:
                     file_stream = io.BytesIO(reply.encode('utf-8'))
                     discord_file = discord.File(fp=file_stream, filename="stargpt_response.txt")
-                    await message.reply("📝 The response is long and detailed, so I compiled it into a file for you!", file=discord_file)
+                    await message.reply("📝 Response is too long, here is the file:", file=discord_file)
                 else:
                     await message.reply(reply)
 
             except Exception as e:
-                print(f"StarGPT Core Error: {e}")
-                await message.reply("❌ My neural networks got a bit tied up. Try rephrasing that!")
+                print(f"StarGPT Error: {e}")
+                await message.reply("❌ Encountered an error, try again!")
 
-    # Pinoproseso ang !clear at !reset commands
     await bot.process_commands(message)
+
+# ==========================================
+# 8. EXECUTOR
+# ==========================================
+if __name__ == "__main__":
+    if not DISCORD_TOKEN or not GROQ_API_KEY:
+        print("❌ Environment variables are missing.")
+    else:
+        bot.run(DISCORD_TOKEN)
