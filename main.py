@@ -545,4 +545,496 @@ async def cmd_setup(interaction: discord.Interaction, channel: discord.TextChann
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
         await db.execute(
-            "INSERT OR IGNORE INTO ai_channels (guild_id, channel_id) VAL
+            "INSERT OR IGNORE INTO ai_channels (guild_id, channel_id) VALUES (?,?)",
+            (interaction.guild.id, channel.id)
+        )
+        await db.commit()
+    setup_channels[interaction.guild.id].add(channel.id)
+    await interaction.response.send_message(f"✅ AI channel added: {channel.mention}")
+
+
+@bot.tree.command(name="removechannel", description="Remove a StarGPT chat channel.")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_removechannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM ai_channels WHERE guild_id=? AND channel_id=?",
+            (interaction.guild.id, channel.id)
+        )
+        await db.commit()
+    setup_channels[interaction.guild.id].discard(channel.id)
+    await interaction.response.send_message(f"✅ AI channel removed: {channel.mention}")
+
+
+@bot.tree.command(name="setmodlog", description="Set the moderation log channel.")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_setmodlog(interaction: discord.Interaction, channel: discord.TextChannel):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO guild_settings (guild_id, mod_log_channel_id) VALUES (?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET mod_log_channel_id=excluded.mod_log_channel_id
+        """, (interaction.guild.id, channel.id))
+        await db.commit()
+    mod_log_channels[interaction.guild.id] = channel.id
+    await interaction.response.send_message(f"✅ Mod log set to: {channel.mention}")
+
+
+@bot.tree.command(name="personality", description="Set StarGPT's personality style.")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_personality(interaction: discord.Interaction, style: str):
+    style = style.lower().strip()
+    if style not in VALID_STYLES:
+        await interaction.response.send_message(
+            f"Invalid style. Options: `{'`, `'.join(sorted(VALID_STYLES))}`", ephemeral=True
+        )
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO guild_settings (guild_id, personality) VALUES (?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET personality=excluded.personality
+        """, (interaction.guild.id, style))
+        await db.commit()
+    guild_styles[interaction.guild.id] = style
+    await interaction.response.send_message(f"✅ Personality set to: **{style}**")
+
+# ==================================================
+# SLASH COMMANDS — MODERATION
+# ==================================================
+
+@bot.tree.command(name="warn", description="Issue a warning to a member.")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.bot:
+        await interaction.response.send_message("Cannot warn bots.", ephemeral=True)
+        return
+
+    total = await add_warning(member.id, interaction.guild.id, reason, interaction.user.id)
+    try:
+        await member.send(
+            f"**⚠️ You were warned** in **{interaction.guild.name}**\n"
+            f"Reason: {reason}\nWarnings: `{total}/{MAX_WARNINGS}`"
+        )
+    except:
+        pass
+
+    await interaction.response.send_message(
+        f"⚠️ {member.mention} warned — `{total}/{MAX_WARNINGS}` warnings.\nReason: {reason}"
+    )
+    await send_mod_log(interaction.guild, make_embed(
+        "⚠️ Warning Issued", discord.Color.yellow(),
+        {"User": f"{member.mention} (`{member.id}`)",
+         "Moderator": interaction.user.mention,
+         "Warnings": f"{total}/{MAX_WARNINGS}",
+         "Reason": reason},
+        user=member
+    ))
+
+    if total >= MAX_WARNINGS:
+        await auto_ban(member, f"Reached {MAX_WARNINGS} warnings. Last: {reason}")
+        await interaction.followup.send(f"🔨 {member.mention} auto-banned.")
+
+
+@bot.tree.command(name="warnings", description="View all warnings for a member.")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_warnings(interaction: discord.Interaction, member: discord.Member):
+    rows = await get_warnings(member.id, interaction.guild.id)
+    if not rows:
+        await interaction.response.send_message(f"{member.mention} has no warnings.", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"Warnings — {member.display_name}", color=discord.Color.orange())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    for wid, reason, mod_id, created_at in rows:
+        mod = interaction.guild.get_member(mod_id)
+        embed.add_field(
+            name=f"#{wid} · {created_at[:10]}",
+            value=f"{reason} — by {mod.display_name if mod else mod_id}",
+            inline=False
+        )
+    embed.set_footer(text=f"Total: {len(rows)}/{MAX_WARNINGS}")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="removewarn", description="Remove a warning by its ID.")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_removewarn(interaction: discord.Interaction, warning_id: int):
+    deleted = await remove_warning(warning_id, interaction.guild.id)
+    if deleted:
+        await interaction.response.send_message(f"✅ Warning `#{warning_id}` removed.")
+        await send_mod_log(interaction.guild, make_embed(
+            "🗑️ Warning Removed", discord.Color.green(),
+            {"Warning ID": f"#{warning_id}", "Moderator": interaction.user.mention}
+        ))
+    else:
+        await interaction.response.send_message(f"Warning `#{warning_id}` not found.", ephemeral=True)
+
+
+@bot.tree.command(name="clearwarnings", description="Clear all warnings for a member.")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_clearwarnings(interaction: discord.Interaction, member: discord.Member):
+    await clear_warnings(member.id, interaction.guild.id)
+    await interaction.response.send_message(f"✅ All warnings cleared for {member.mention}.")
+    await send_mod_log(interaction.guild, make_embed(
+        "🧹 Warnings Cleared", discord.Color.green(),
+        {"User": member.mention, "Moderator": interaction.user.mention}
+    ))
+
+
+@bot.tree.command(name="kick", description="Kick a member from the server.")
+@app_commands.checks.has_permissions(kick_members=True)
+async def cmd_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.bot:
+        await interaction.response.send_message("Cannot kick bots.", ephemeral=True)
+        return
+    try:
+        await member.send(f"You were **kicked** from **{interaction.guild.name}**.\nReason: {reason}")
+    except:
+        pass
+    try:
+        await member.kick(reason=reason)
+    except discord.Forbidden:
+        await interaction.response.send_message("Missing permissions.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"👢 {member.mention} kicked. Reason: {reason}")
+    await send_mod_log(interaction.guild, make_embed(
+        "👢 Member Kicked", discord.Color.orange(),
+        {"User": f"{member.mention} (`{member.id}`)",
+         "Moderator": interaction.user.mention, "Reason": reason},
+        user=member
+    ))
+
+
+@bot.tree.command(name="ban", description="Ban a member from the server.")
+@app_commands.checks.has_permissions(ban_members=True)
+async def cmd_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.bot:
+        await interaction.response.send_message("Cannot ban bots.", ephemeral=True)
+        return
+    try:
+        await member.send(f"You were **banned** from **{interaction.guild.name}**.\nReason: {reason}")
+    except:
+        pass
+    try:
+        await member.ban(reason=reason)
+    except discord.Forbidden:
+        await interaction.response.send_message("Missing permissions.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔨 {member.mention} banned. Reason: {reason}")
+    await send_mod_log(interaction.guild, make_embed(
+        "🔨 Member Banned", discord.Color.red(),
+        {"User": f"{member.mention} (`{member.id}`)",
+         "Moderator": interaction.user.mention, "Reason": reason},
+        user=member
+    ))
+
+
+@bot.tree.command(name="mute", description="Timeout a member for N minutes.")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_mute(interaction: discord.Interaction, member: discord.Member,
+                   minutes: int, reason: str = "No reason provided"):
+    if member.bot:
+        await interaction.response.send_message("Cannot mute bots.", ephemeral=True)
+        return
+    try:
+        await member.timeout(datetime.timedelta(minutes=minutes), reason=reason)
+    except discord.Forbidden:
+        await interaction.response.send_message("Missing permissions.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔇 {member.mention} muted for {minutes} min. Reason: {reason}")
+    await send_mod_log(interaction.guild, make_embed(
+        "🔇 Member Muted", discord.Color.orange(),
+        {"User": f"{member.mention} (`{member.id}`)",
+         "Moderator": interaction.user.mention,
+         "Duration": f"{minutes} min", "Reason": reason},
+        user=member
+    ))
+
+
+@bot.tree.command(name="unmute", description="Remove timeout from a member.")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_unmute(interaction: discord.Interaction, member: discord.Member):
+    try:
+        await member.timeout(None)
+    except discord.Forbidden:
+        await interaction.response.send_message("Missing permissions.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔊 {member.mention} unmuted.")
+    await send_mod_log(interaction.guild, make_embed(
+        "🔊 Member Unmuted", discord.Color.green(),
+        {"User": member.mention, "Moderator": interaction.user.mention}
+    ))
+
+
+@bot.tree.command(name="purge", description="Delete messages from this channel (max 100).")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def cmd_purge(interaction: discord.Interaction, amount: int):
+    if not 1 <= amount <= 100:
+        await interaction.response.send_message("Amount must be 1–100.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(limit=amount)
+    await interaction.followup.send(f"🗑️ Deleted {len(deleted)} messages.")
+    await send_mod_log(interaction.guild, make_embed(
+        "🗑️ Purge", discord.Color.blurple(),
+        {"Channel": interaction.channel.mention,
+         "Moderator": interaction.user.mention,
+         "Deleted": len(deleted)}
+    ))
+
+
+@bot.tree.command(name="slowmode", description="Set slowmode delay in seconds (0 = off).")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def cmd_slowmode(interaction: discord.Interaction, seconds: int):
+    try:
+        await interaction.channel.edit(slowmode_delay=max(0, seconds))
+    except discord.Forbidden:
+        await interaction.response.send_message("Missing permissions.", ephemeral=True)
+        return
+    msg = f"✅ Slowmode set to {seconds}s." if seconds > 0 else "✅ Slowmode disabled."
+    await interaction.response.send_message(msg)
+
+
+@bot.tree.command(name="lock", description="Prevent everyone from sending messages in this channel.")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def cmd_lock(interaction: discord.Interaction):
+    ow = interaction.channel.overwrites_for(interaction.guild.default_role)
+    ow.send_messages = False
+    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
+    await interaction.response.send_message("🔒 Channel locked.")
+    await send_mod_log(interaction.guild, make_embed(
+        "🔒 Channel Locked", discord.Color.red(),
+        {"Channel": interaction.channel.mention, "Moderator": interaction.user.mention}
+    ))
+
+
+@bot.tree.command(name="unlock", description="Restore message permissions in this channel.")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def cmd_unlock(interaction: discord.Interaction):
+    ow = interaction.channel.overwrites_for(interaction.guild.default_role)
+    ow.send_messages = True
+    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
+    await interaction.response.send_message("🔓 Channel unlocked.")
+    await send_mod_log(interaction.guild, make_embed(
+        "🔓 Channel Unlocked", discord.Color.green(),
+        {"Channel": interaction.channel.mention, "Moderator": interaction.user.mention}
+    ))
+
+# ==================================================
+# SLASH COMMANDS — USER
+# ==================================================
+
+@bot.tree.command(name="remember", description="Save a personal detail so StarGPT remembers you.")
+async def cmd_remember(interaction: discord.Interaction, key: str, value: str):
+    key = key.lower().strip()
+    if key not in VALID_PROFILE_KEYS:
+        await interaction.response.send_message(
+            f"Invalid key. Options: `{'`, `'.join(sorted(VALID_PROFILE_KEYS))}`", ephemeral=True
+        )
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM profiles WHERE user_id=?", (interaction.user.id,))
+        exists = await cur.fetchone()
+        if exists:
+            await db.execute(f"UPDATE profiles SET {key}=? WHERE user_id=?", (value, interaction.user.id))
+        else:
+            data = {k: None for k in VALID_PROFILE_KEYS}
+            data[key] = value
+            await db.execute(
+                "INSERT INTO profiles (user_id, nickname, language, favorite_game, age, bio) VALUES (?,?,?,?,?,?)",
+                (interaction.user.id, data["nickname"], data["language"],
+                 data["favorite_game"], data["age"], data["bio"])
+            )
+        await db.commit()
+    await interaction.response.send_message(f"✅ Saved `{key}`: {value}", ephemeral=True)
+
+
+@bot.tree.command(name="appeal", description="Submit an appeal for a moderation action.")
+async def cmd_appeal(interaction: discord.Interaction, reason: str):
+    await interaction.response.defer(ephemeral=True)
+    decision = await review_appeal(reason)
+    if decision == "APPROVE":
+        await interaction.followup.send("✅ Your appeal has been approved.")
+    else:
+        await interaction.followup.send("❌ Your appeal was denied.")
+
+# ==================================================
+# ANTI-RAID
+# ==================================================
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    gid = member.guild.id
+    now = time.time()
+
+    join_tracker[gid].append(now)
+    recent = [t for t in join_tracker[gid] if now - t < 15]
+    join_tracker[gid] = recent
+
+    if len(recent) >= 10:
+        try:
+            await member.guild.edit(verification_level=discord.VerificationLevel.high)
+        except:
+            pass
+        await send_mod_log(member.guild, discord.Embed(
+            title="🚨 Raid Detected",
+            description=f"{len(recent)} members joined in 15 seconds. Verification raised to HIGH.",
+            color=discord.Color.red(),
+            timestamp=datetime.datetime.utcnow()
+        ))
+
+    age_days   = (discord.utils.utcnow() - member.created_at).days
+    suspicious = age_days < 7 or member.avatar is None
+
+    if suspicious:
+        try:
+            await member.timeout(datetime.timedelta(minutes=30), reason="Suspicious account")
+        except:
+            pass
+        await send_mod_log(member.guild, make_embed(
+            "⚠️ Suspicious Account", discord.Color.orange(),
+            {"User": f"{member.mention} (`{member.id}`)",
+             "Account Age": f"{age_days} days",
+             "Has Avatar": str(member.avatar is not None),
+             "Action": "Timed out 30 min"},
+            user=member
+        ))
+
+# ==================================================
+# MAIN MESSAGE HANDLER
+# ==================================================
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    content   = message.content.strip() if message.content else ""
+    has_image = any(
+        a.content_type and a.content_type.startswith("image/")
+        for a in message.attachments
+    )
+
+    if not content and not has_image:
+        return
+
+    is_ai_channel = message.channel.id in setup_channels.get(message.guild.id, set())
+
+    # ── AUTOMOD: text (runs in ALL channels) ──────────────────────────────
+    if content:
+        violation = rule_based_check(message)
+        if not violation:
+            violation = await classify_message(content)
+            if violation == "SAFE":
+                violation = None
+
+        if violation:
+            try:
+                await message.delete()
+            except:
+                pass
+            await punish(message.author, violation)
+            return
+
+    # ── AUTOMOD: images (runs in ALL channels) ────────────────────────────
+    if has_image:
+        for att in message.attachments:
+            if not (att.content_type and att.content_type.startswith("image/")):
+                continue
+            try:
+                img_b64, mime = await fetch_image_b64(att.url)
+                img_violation = await classify_image(img_b64, mime)
+                if img_violation != "SAFE":
+                    try:
+                        await message.delete()
+                    except:
+                        pass
+                    await punish(message.author, img_violation)
+                    return
+            except:
+                pass
+
+    # ── AI CHAT (only in configured AI channels) ──────────────────────────
+    if not is_ai_channel:
+        return
+
+    chat_key = (message.guild.id, message.author.id, message.channel.id)
+    if chat_key in active_chats:
+        return
+    active_chats.add(chat_key)
+
+    try:
+        async with message.channel.typing():
+            style = guild_styles.get(message.guild.id, "friendly")
+            style_notes = {
+                "friendly":  "You're warm, encouraging, and approachable.",
+                "serious":   "You're precise, professional, and skip small talk.",
+                "funny":     "You're witty and love a well-placed joke, but stay helpful.",
+                "anime":     "You're expressive, enthusiastic, and slightly dramatic like an anime character.",
+                "sarcastic": "You're dry, sarcastic, and deadpan — but never actually mean.",
+            }.get(style, "")
+
+            profile_text = await load_profile(message.author.id)
+            history      = await load_memory(message.author.id, message.guild.id)
+
+            system = STARGPT_SYSTEM
+            if style_notes:
+                system += f"\n\nPersonality modifier: {style_notes}"
+            if profile_text:
+                system += f"\n\nWhat you know about this user:\n{profile_text}"
+
+            msgs = [{"role": "system", "content": system}]
+            msgs.extend(history)
+
+            user_text = content if content else "I sent you an image — what do you think?"
+            if has_image and content:
+                user_text = f"{content}\n[image attached]"
+
+            msgs.append({"role": "user", "content": user_text})
+
+            # Vision: grab first image if present
+            image_b64, image_mime = None, "image/png"
+            if has_image:
+                for att in message.attachments:
+                    if att.content_type and att.content_type.startswith("image/"):
+                        try:
+                            image_b64, image_mime = await fetch_image_b64(att.url)
+                        except:
+                            pass
+                        break
+
+            response = await generate_response(msgs, image_b64=image_b64, image_mime=image_mime)
+
+            await save_memory(message.author.id, message.guild.id, "user", user_text)
+            await save_memory(message.author.id, message.guild.id, "assistant", response)
+
+            await send_chunked(message.channel, response, reply_to=message)
+
+    finally:
+        active_chats.discard(chat_key)
+
+# ==================================================
+# READY
+# ==================================================
+
+_ready_done = False
+
+@bot.event
+async def on_ready():
+    global _ready_done
+    await setup_database()
+    await load_cache()
+
+    if not _ready_done:
+        try:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} slash commands")
+        except Exception as e:
+            print(f"Sync error: {e}")
+        _ready_done = True
+
+    print(f"StarGPT online — {bot.user} (ID: {bot.user.id})")
+
+# ==================================================
+# RUN
+# ==================================================
+
+bot.run(DISCORD_TOKEN)
