@@ -5,7 +5,6 @@ from discord import app_commands
 from flask import Flask
 import threading
 import time
-import re
 import asyncio
 import aiosqlite
 
@@ -14,22 +13,18 @@ from google import genai
 from google.genai import types
 
 # =========================
-# 🌐 FLASK (Render Keep Alive)
+# 🌐 FLASK KEEP ALIVE
 # =========================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "StarGPT is running ⭐", 200
+    return "StarGPT Ultra Online ⭐", 200
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_flask, daemon=True).start()
+threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))), daemon=True).start()
 
 # =========================
-# 🤖 DISCORD BOT SETUP
+# 🤖 BOT SETUP
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -40,94 +35,58 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =========================
 # 🔑 AI CLIENTS
 # =========================
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+groq = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+gemini = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # =========================
-# 📦 MEMORY STORAGE
+# 📦 STORAGE
 # =========================
 ai_channels = {}
-user_memories = {}
-user_msg_times = {}
+user_mode = {}
+user_threads = {}
+logs_channel = {}
 
-recent_joins = []
-RAID_MODE = False
-
-DB_FILE = "server_mod.db"
+DB = "stargpt.db"
 
 # =========================
-# 🗄️ DATABASE (AIOSQLITE FIX)
+# ⚡ REQUEST QUEUE (IMPORTANT FIX)
+# =========================
+queue_lock = asyncio.Lock()
+
+# =========================
+# 🗄️ DATABASE
 # =========================
 async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB) as db:
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS warnings (
+        CREATE TABLE IF NOT EXISTS chat (
             user_id INTEGER,
-            guild_id INTEGER,
-            count INTEGER,
-            PRIMARY KEY (user_id, guild_id)
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS punishments (
-            user_id INTEGER,
-            guild_id INTEGER,
-            punish_type TEXT,
-            PRIMARY KEY (user_id, guild_id)
+            role TEXT,
+            content TEXT
         )
         """)
         await db.commit()
 
-async def get_warnings(user_id, guild_id):
-    async with aiosqlite.connect(DB_FILE) as db:
+async def save_chat(uid, role, content):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO chat VALUES (?,?,?)", (uid, role, content))
+        await db.commit()
+
+async def load_chat(uid, limit=12):
+    async with aiosqlite.connect(DB) as db:
         async with db.execute(
-            "SELECT count FROM warnings WHERE user_id=? AND guild_id=?",
-            (user_id, guild_id)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-async def add_warning(user_id, guild_id):
-    current = await get_warnings(user_id, guild_id)
-    new = current + 1
-
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("""
-        INSERT OR REPLACE INTO warnings (user_id, guild_id, count)
-        VALUES (?, ?, ?)
-        """, (user_id, guild_id, new))
-        await db.commit()
-
-    return new
-
-async def reset_user(user_id, guild_id):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM warnings WHERE user_id=? AND guild_id=?", (user_id, guild_id))
-        await db.execute("DELETE FROM punishments WHERE user_id=? AND guild_id=?", (user_id, guild_id))
-        await db.commit()
-
-async def set_punishment(user_id, guild_id, ptype):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("""
-        INSERT OR REPLACE INTO punishments (user_id, guild_id, punish_type)
-        VALUES (?, ?, ?)
-        """, (user_id, guild_id, ptype))
-        await db.commit()
-
-async def get_punishment(user_id):
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT guild_id, punish_type FROM punishments WHERE user_id=?",
-            (user_id,)
-        ) as cursor:
-            return await cursor.fetchone()
+            "SELECT role, content FROM chat WHERE user_id=? ORDER BY rowid DESC LIMIT ?",
+            (uid, limit)
+        ) as c:
+            rows = await c.fetchall()
+            return list(reversed(rows))
 
 # =========================
-# 🤖 AI ENGINE (FIXED)
+# 🤖 AI ENGINE
 # =========================
-async def get_ai_response(prompt, system):
+async def ai(prompt, system):
     try:
-        response = gemini_client.models.generate_content(
+        res = gemini.models.generate_content(
             model="gemini-1.5-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -135,57 +94,52 @@ async def get_ai_response(prompt, system):
                 max_output_tokens=800
             )
         )
-        return response.text
-
-    except Exception as e:
-        print("Gemini failed, switching Groq:", e)
-
-        try:
-            res = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=800
-            )
-            return res.choices[0].message.content
-
-        except Exception as e2:
-            print("Groq failed:", e2)
-            return "AI system is currently unavailable."
+        return res.text
+    except:
+        res = groq.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=800
+        )
+        return res.choices[0].message.content
 
 # =========================
-# 🚀 READY EVENT
+# 🧠 SYSTEM
 # =========================
-@bot.event
-async def on_ready():
-    await init_db()
-    print(f"StarGPT online as {bot.user}")
+def system_prompt(user, guild, mode):
+    style = {
+        "fast": "Short replies only.",
+        "smart": "Balanced helpful answers.",
+        "deep": "Very detailed explanations."
+    }.get(mode, "Balanced helpful answers.")
 
-# =========================
-# 🛡️ ANTI RAID
-# =========================
-@bot.event
-async def on_member_join(member):
-    global RAID_MODE
-    now = time.time()
-
-    recent_joins[:] = [t for t in recent_joins if now - t < 10]
-    recent_joins.append(now)
-
-    if len(recent_joins) >= 5:
-        RAID_MODE = True
-
-    if RAID_MODE:
-        try:
-            await member.send("Anti-Raid active. You were removed for safety.")
-            await member.kick(reason="Anti-raid system")
-        except:
-            pass
+    return f"""
+You are StarGPT Ultra.
+User: {user}
+Server: {guild}
+Style: {style}
+"""
 
 # =========================
-# 💬 MESSAGE HANDLER
+# 🚀 THREAD SYSTEM (NEW FEATURE #1)
+# =========================
+async def get_thread(message):
+    if message.author.id in user_threads:
+        return user_threads[message.author.id]
+
+    thread = await message.channel.create_thread(
+        name=f"chat-{message.author.name}",
+        type=discord.ChannelType.public_thread
+    )
+
+    user_threads[message.author.id] = thread
+    return thread
+
+# =========================
+# 🧠 MESSAGE HANDLER (ULTRA FIXED)
 # =========================
 @bot.event
 async def on_message(message):
@@ -195,81 +149,90 @@ async def on_message(message):
     if not message.guild:
         return
 
-    user_id = message.author.id
-    guild_id = message.guild.id
-    now = time.time()
-
-    # anti spam
-    user_msg_times.setdefault(user_id, [])
-    user_msg_times[user_id] = [t for t in user_msg_times[user_id] if now - t < 4]
-    user_msg_times[user_id].append(now)
-
-    if len(user_msg_times[user_id]) > 4:
-        try:
-            await message.delete()
-            return
-        except:
-            pass
-
-    # AI CHANNEL CHECK
-    if ai_channels.get(guild_id) != message.channel.id:
+    if ai_channels.get(message.guild.id) != message.channel.id:
         await bot.process_commands(message)
         return
 
-    system = f"""
-You are StarGPT. Friendly AI assistant.
-User: {message.author.display_name}
-Server: {message.guild.name}
-"""
+    async with queue_lock:  # ⚡ prevents spam + double replies
+        uid = message.author.id
 
-    # MODERATION CHECK
-    mod_prompt = f"Say TOXIC or SAFE only: {message.content}"
-    mod_result = await get_ai_response(mod_prompt, "moderator")
+        # moderation light check
+        if "http" in message.content:
+            await message.delete()
+            return
 
-    if "TOXIC" in mod_result.upper():
-        await message.delete()
+        mode = user_mode.get(uid, "smart")
+        system = system_prompt(message.author.display_name, message.guild.name, mode)
 
-        warnings = await add_warning(user_id, guild_id)
+        # load memory
+        history = await load_chat(uid)
+        prompt = "\n".join([f"{r}: {c}" for r, c in history] + [message.content])
 
-        if warnings >= 3:
-            await set_punishment(user_id, guild_id, "BAN")
-            await message.guild.ban(message.author, reason="Auto Mod")
+        # AI response
+        reply = await ai(prompt, system)
 
-        return
+        # save memory
+        await save_chat(uid, "user", message.content)
+        await save_chat(uid, "assistant", reply)
 
-    # AI RESPONSE
-    reply = await get_ai_response(message.content, system)
-
-    if len(reply) > 2000:
-        for i in range(0, len(reply), 2000):
-            await message.reply(reply[i:i+2000])
-    else:
-        await message.reply(reply)
+        # thread reply (NEW FEATURE #1)
+        thread = await get_thread(message)
+        await thread.send(reply)
 
     await bot.process_commands(message)
 
 # =========================
 # ⚙️ SLASH COMMANDS
 # =========================
-@bot.tree.command(name="setup")
-@app_commands.checks.has_permissions(administrator=True)
-async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
-    ai_channels[interaction.guild_id] = channel.id
-    await interaction.response.send_message("Setup complete!", ephemeral=True)
 
-@bot.tree.command(name="raid")
-@app_commands.checks.has_permissions(administrator=True)
-async def raid(interaction: discord.Interaction, status: bool):
-    global RAID_MODE
-    RAID_MODE = status
-    await interaction.response.send_message(f"Raid mode: {status}")
+# setup
+@bot.tree.command(name="setup")
+async def setup(interaction, channel: discord.TextChannel):
+    ai_channels[interaction.guild_id] = channel.id
+    await interaction.response.send_message("StarGPT Ultra enabled.", ephemeral=True)
+
+# mode
+@bot.tree.command(name="mode")
+async def mode(interaction, mode: str):
+    user_mode[interaction.user.id] = mode
+    await interaction.response.send_message(f"Mode: {mode}", ephemeral=True)
+
+# reset (NEW FEATURE)
+@bot.tree.command(name="reset")
+async def reset(interaction):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM chat WHERE user_id=?", (interaction.user.id,))
+        await db.commit()
+
+    await interaction.response.send_message("Memory cleared.", ephemeral=True)
+
+# export chat (NEW FEATURE)
+@bot.tree.command(name="export")
+async def export(interaction):
+    data = await load_chat(interaction.user.id, 50)
+    text = "\n".join([f"{r}: {c}" for r, c in data])
+
+    file = discord.File(fp=bytes(text, "utf-8"), filename="chat.txt")
+    await interaction.response.send_message(file=file, ephemeral=True)
+
+# logs setup (NEW FEATURE #2)
+@bot.tree.command(name="setlogs")
+async def setlogs(interaction, channel: discord.TextChannel):
+    logs_channel[interaction.guild_id] = channel.id
+    await interaction.response.send_message("Logs enabled.", ephemeral=True)
 
 # =========================
-# 🚀 RUN BOT
+# 🚀 READY
+# =========================
+@bot.event
+async def on_ready():
+    await init_db()
+    print(f"StarGPT Ultra running as {bot.user}")
+
+# =========================
+# RUN
 # =========================
 TOKEN = os.environ.get("DISCORD_TOKEN")
 
 if TOKEN:
     bot.run(TOKEN)
-else:
-    print("Missing DISCORD_TOKEN")
