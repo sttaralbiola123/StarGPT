@@ -1,9 +1,11 @@
 import os
 import re
 import time
+import base64
 import asyncio
 import datetime
 import sqlite3
+import aiohttp
 from threading import Thread
 from collections import defaultdict
 
@@ -18,10 +20,11 @@ from discord import app_commands
 # CONFIG
 # ==================================================
 
-DB_PATH = "stargpt.db"
+DB_PATH      = "stargpt.db"
+MAX_WARNINGS = 3
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DISCORD_TOKEN = os.getenv("DISCORD")
+GROQ_API_KEY  = os.getenv("GROQ")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing")
@@ -29,6 +32,27 @@ if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is missing")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+VALID_PROFILE_KEYS = {"nickname", "language", "favorite_game", "age", "bio"}
+VALID_STYLES       = {"friendly", "serious", "funny", "anime", "sarcastic"}
+
+# StarGPT core personality
+STARGPT_SYSTEM = """
+You are StarGPT — a sharp, self-aware AI assistant living inside a Discord server.
+You have a real personality: curious, witty, occasionally playful, but always genuinely helpful.
+You do NOT act like a bot. You talk like a smart friend who happens to know everything.
+
+Rules:
+- Never say you are an AI unless the user sincerely asks.
+- Never start a reply with "Sure!", "Of course!", "Certainly!" or similar filler phrases.
+- Keep replies concise unless the user clearly wants detail.
+- Use casual Discord formatting (bold, code blocks) when it helps clarity.
+- If someone sends an image, describe and analyze it naturally as part of the conversation.
+- Match the user's energy: chill when they're chill, detailed when they ask for depth.
+- Always reply in English unless the user's profile language says otherwise.
+- You remember context from earlier in the conversation.
+- Never be preachy or add unsolicited moral commentary.
+"""
 
 # ==================================================
 # WEB SERVER
@@ -40,63 +64,43 @@ app = Flask(__name__)
 def home():
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-
-        cur.execute("SELECT COUNT(*) FROM ai_channels")
-        channel_count = cur.fetchone()[0]
-
-        cur.execute("SELECT COUNT(*) FROM memory")
-        memory_count = cur.fetchone()[0]
-
-        cur.execute("SELECT COUNT(*) FROM profiles")
-        profile_count = cur.fetchone()[0]
-
+        cur  = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM ai_channels"); channels = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM memory");     memories  = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM profiles");   profiles  = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM warnings");   warns     = cur.fetchone()[0]
         conn.close()
     except:
-        channel_count = 0
-        memory_count = 0
-        profile_count = 0
+        channels = memories = profiles = warns = 0
 
     return f"""
-    <html>
-    <head>
-        <title>StarGPT Online</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #0f172a;
-                color: white;
-                padding: 40px;
-            }}
-            .card {{
-                background: #1e293b;
-                padding: 24px;
-                border-radius: 16px;
-                max-width: 520px;
-            }}
-            h1 {{ margin-top: 0; }}
-            .muted {{ color: #cbd5e1; }}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <h1>StarGPT Online</h1>
-            <p class="muted">Bot is running.</p>
-            <p>Configured AI channels: {channel_count}</p>
-            <p>Saved memory rows: {memory_count}</p>
-            <p>Saved profiles: {profile_count}</p>
-        </div>
-    </body>
-    </html>
+    <html><head><title>StarGPT</title>
+    <style>
+        body {{ font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #f1f5f9; padding: 48px; }}
+        .card {{ background: #1e293b; border: 1px solid #334155; padding: 32px; border-radius: 20px; max-width: 540px; }}
+        h1 {{ margin: 0 0 8px; font-size: 28px; }}
+        .badge {{ display:inline-block; background:#22c55e; color:#fff; border-radius:6px; padding:2px 10px; font-size:13px; margin-bottom:20px; }}
+        .stat {{ display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid #334155; }}
+        .stat:last-child {{ border-bottom:none; }}
+        .val {{ font-weight:600; color:#38bdf8; }}
+    </style></head><body>
+    <div class="card">
+        <h1>⭐ StarGPT</h1>
+        <div class="badge">● Online</div>
+        <div class="stat"><span>AI Channels</span><span class="val">{channels}</span></div>
+        <div class="stat"><span>Memory Rows</span><span class="val">{memories}</span></div>
+        <div class="stat"><span>User Profiles</span><span class="val">{profiles}</span></div>
+        <div class="stat"><span>Total Warnings</span><span class="val">{warns}</span></div>
+    </div></body></html>
     """
 
-def run_web():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-Thread(target=run_web, daemon=True).start()
+Thread(
+    target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))),
+    daemon=True
+).start()
 
 # ==================================================
-# DISCORD BOT
+# BOT SETUP
 # ==================================================
 
 intents = discord.Intents.all()
@@ -106,18 +110,41 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==================================================
-# CACHE
+# IN-MEMORY CACHE
 # ==================================================
 
-warning_counts = defaultdict(int)
-join_tracker = defaultdict(list)
-active_chats = set()
+setup_channels   = defaultdict(set)   # guild_id -> set of channel_ids
+guild_styles     = {}                  # guild_id -> personality string
+mod_log_channels = {}                  # guild_id -> channel_id
+active_chats     = set()               # (guild_id, user_id, channel_id) concurrency lock
+join_tracker     = defaultdict(list)   # guild_id -> list of join timestamps
+spam_tracker     = defaultdict(list)   # (guild_id, user_id) -> message timestamps
+message_tracker  = defaultdict(list)   # (guild_id, user_id) -> recent message contents
 
-setup_channels = defaultdict(set)   # guild_id -> set(channel_id)
-guild_styles = {}                   # guild_id -> personality
+# ==================================================
+# AUTOMOD CONSTANTS
+# ==================================================
 
-VALID_PROFILE_KEYS = {"nickname", "language", "favorite_game"}
-VALID_STYLES = {"friendly", "serious", "funny", "anime"}
+SPAM_THRESHOLD        = 5    # messages within SPAM_WINDOW seconds = spam
+SPAM_WINDOW           = 6    # seconds
+DUP_THRESHOLD         = 3    # same message N times in a row = spam
+MASS_MENTION_THRESHOLD = 5   # mentions in one message = harassment
+
+INVITE_PATTERN = re.compile(r"discord(?:\.gg|app\.com/invite)/\S+", re.IGNORECASE)
+ZALGO_PATTERN  = re.compile(r"[\u0300-\u036f\u0489]{4,}")
+
+TIMEOUT_DURATIONS = {
+    "SPAM":       5,
+    "SCAM":       60,
+    "TOXIC":      15,
+    "HARASSMENT": 30,
+    "NSFW":       120,
+    "THREAT":     1440,
+    "EXTREME":    1440,
+    "GORE":       1440,
+    "HATE_SYMBOL":720,
+    "ILLEGAL":    1440,
+}
 
 # ==================================================
 # DATABASE
@@ -127,119 +154,147 @@ async def setup_database():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
-
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS memory (
-            user_id INTEGER,
-            guild_id INTEGER,
-            role TEXT,
-            content TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
+            CREATE TABLE IF NOT EXISTS memory (
+                user_id INTEGER, guild_id INTEGER, role TEXT, content TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
         """)
-
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            user_id INTEGER PRIMARY KEY,
-            nickname TEXT,
-            language TEXT,
-            favorite_game TEXT
-        )
+            CREATE TABLE IF NOT EXISTS profiles (
+                user_id INTEGER PRIMARY KEY,
+                nickname TEXT, language TEXT, favorite_game TEXT, age TEXT, bio TEXT
+            )
         """)
-
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS ai_channels (
-            guild_id INTEGER,
-            channel_id INTEGER,
-            PRIMARY KEY (guild_id, channel_id)
-        )
+            CREATE TABLE IF NOT EXISTS ai_channels (
+                guild_id INTEGER, channel_id INTEGER,
+                PRIMARY KEY (guild_id, channel_id)
+            )
         """)
-
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS guild_settings (
-            guild_id INTEGER PRIMARY KEY,
-            personality TEXT DEFAULT 'friendly'
-        )
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id           INTEGER PRIMARY KEY,
+                personality        TEXT    DEFAULT 'friendly',
+                mod_log_channel_id INTEGER DEFAULT NULL
+            )
         """)
-
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, guild_id INTEGER, reason TEXT,
+                moderator_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS automod_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER, user_id INTEGER,
+                action TEXT, reason TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
+
 
 async def load_cache():
     setup_channels.clear()
     guild_styles.clear()
+    mod_log_channels.clear()
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT guild_id, channel_id FROM ai_channels") as cur:
-            async for guild_id, channel_id in cur:
-                setup_channels[int(guild_id)].add(int(channel_id))
-
-        async with db.execute("SELECT guild_id, personality FROM guild_settings") as cur:
-            async for guild_id, personality in cur:
-                guild_styles[int(guild_id)] = personality or "friendly"
+            async for gid, cid in cur:
+                setup_channels[int(gid)].add(int(cid))
+        async with db.execute("SELECT guild_id, personality, mod_log_channel_id FROM guild_settings") as cur:
+            async for gid, style, log_cid in cur:
+                guild_styles[int(gid)] = style or "friendly"
+                if log_cid:
+                    mod_log_channels[int(gid)] = int(log_cid)
 
 # ==================================================
-# AI HELPERS
+# GROQ / AI HELPERS
 # ==================================================
 
-async def groq_chat(messages, temperature=0.7, max_tokens=400):
+async def groq_chat(messages, temperature=0.8, max_tokens=600,
+                    vision_b64=None, vision_mime="image/png"):
     def run():
+        msgs = list(messages)
+        if vision_b64:
+            last = msgs[-1]
+            if last["role"] == "user":
+                msgs[-1] = {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:{vision_mime};base64,{vision_b64}"}},
+                        {"type": "text",
+                         "text": last["content"] if isinstance(last["content"], str) else "Analyze this image."}
+                    ]
+                }
+        model = "llama-3.2-11b-vision-preview" if vision_b64 else "llama-3.1-8b-instant"
         return groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            model=model, messages=msgs,
+            temperature=temperature, max_tokens=max_tokens
         )
 
-    return await asyncio.wait_for(asyncio.to_thread(run), timeout=40)
+    return await asyncio.wait_for(asyncio.to_thread(run), timeout=45)
 
-async def generate_ai(messages):
-    res = await groq_chat(messages, temperature=0.7, max_tokens=400)
+
+async def generate_response(messages, image_b64=None, image_mime="image/png") -> str:
+    res = await groq_chat(messages, vision_b64=image_b64, vision_mime=image_mime)
     return res.choices[0].message.content.strip()
 
-async def ai_moderation(text):
-    system = """
-Classify the message into ONLY ONE label:
 
-SAFE
-SPAM
-SCAM
-TOXIC
-HARASSMENT
-EXTREME
-
-Return only the label.
-"""
+async def classify_message(text: str) -> str:
+    system = (
+        "Classify this Discord message into exactly one label: "
+        "SAFE, SPAM, SCAM, TOXIC, HARASSMENT, NSFW, THREAT, EXTREME\n"
+        "Reply with only the label."
+    )
     try:
         res = await groq_chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            max_tokens=20,
+            [{"role": "system", "content": system},
+             {"role": "user",   "content": text}],
+            temperature=0, max_tokens=15
         )
         raw = res.choices[0].message.content.strip().upper()
-        for label in ["SAFE", "SPAM", "SCAM", "TOXIC", "HARASSMENT", "EXTREME"]:
-            if raw == label or raw.startswith(label):
+        for label in ["SAFE","SPAM","SCAM","TOXIC","HARASSMENT","NSFW","THREAT","EXTREME"]:
+            if raw.startswith(label):
                 return label
         return "SAFE"
     except:
         return "SAFE"
 
-async def ai_appeal_review(reason):
-    system = """
-Reply ONLY with:
-APPROVE
-DENY
-"""
+
+async def classify_image(image_b64: str, mime: str) -> str:
+    system = (
+        "You are a content moderation AI. Classify this image into exactly one label: "
+        "SAFE, NSFW, GORE, HATE_SYMBOL, SCAM, ILLEGAL\n"
+        "Reply with only the label."
+    )
     try:
         res = await groq_chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": reason},
-            ],
-            temperature=0,
-            max_tokens=10,
+            [{"role": "system", "content": system},
+             {"role": "user",   "content": "Classify this image."}],
+            temperature=0, max_tokens=15,
+            vision_b64=image_b64, vision_mime=mime
+        )
+        raw = res.choices[0].message.content.strip().upper()
+        for label in ["SAFE","NSFW","GORE","HATE_SYMBOL","SCAM","ILLEGAL"]:
+            if raw.startswith(label):
+                return label
+        return "SAFE"
+    except:
+        return "SAFE"
+
+
+async def review_appeal(reason: str) -> str:
+    system = "Review this moderation appeal. Reply with only APPROVE or DENY."
+    try:
+        res = await groq_chat(
+            [{"role": "system", "content": system},
+             {"role": "user",   "content": reason}],
+            temperature=0, max_tokens=10
         )
         raw = res.choices[0].message.content.strip().upper()
         return "APPROVE" if "APPROVE" in raw else "DENY"
@@ -247,370 +302,247 @@ DENY
         return "DENY"
 
 # ==================================================
-# MEMORY
+# RULE-BASED CHECKS (instant, no AI call)
+# ==================================================
+
+def rule_based_check(message: discord.Message):
+    content = message.content
+    key     = (message.guild.id, message.author.id)
+    now     = time.time()
+
+    # Rate spam
+    spam_tracker[key].append(now)
+    spam_tracker[key] = [t for t in spam_tracker[key] if now - t < SPAM_WINDOW]
+    if len(spam_tracker[key]) >= SPAM_THRESHOLD:
+        return "SPAM"
+
+    # Duplicate spam
+    message_tracker[key].append(content.lower().strip())
+    message_tracker[key] = message_tracker[key][-DUP_THRESHOLD:]
+    if (len(message_tracker[key]) == DUP_THRESHOLD
+            and len(set(message_tracker[key])) == 1):
+        return "SPAM"
+
+    if INVITE_PATTERN.search(content):
+        return "SCAM"
+
+    if len(message.mentions) >= MASS_MENTION_THRESHOLD:
+        return "HARASSMENT"
+
+    if ZALGO_PATTERN.search(content):
+        return "TOXIC"
+
+    return None
+
+# ==================================================
+# MEMORY & PROFILES
 # ==================================================
 
 async def save_memory(user_id, guild_id, role, content):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO memory (user_id, guild_id, role, content) VALUES (?, ?, ?, ?)",
-            (user_id, guild_id, role, content),
+            "INSERT INTO memory (user_id, guild_id, role, content) VALUES (?,?,?,?)",
+            (user_id, guild_id, role, content)
         )
         await db.commit()
-
-        # keep only recent 60 rows per user/guild to prevent bloat
         await db.execute("""
-        DELETE FROM memory
-        WHERE rowid NOT IN (
-            SELECT rowid
-            FROM memory
-            WHERE user_id=? AND guild_id=?
-            ORDER BY rowid DESC
-            LIMIT 60
-        )
+            DELETE FROM memory WHERE rowid NOT IN (
+                SELECT rowid FROM memory WHERE user_id=? AND guild_id=?
+                ORDER BY rowid DESC LIMIT 80
+            )
         """, (user_id, guild_id))
         await db.commit()
+
 
 async def load_memory(user_id, guild_id):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
-        SELECT role, content
-        FROM memory
-        WHERE user_id=? AND guild_id=?
-        ORDER BY rowid DESC
-        LIMIT 8
+            SELECT role, content FROM memory
+            WHERE user_id=? AND guild_id=?
+            ORDER BY rowid DESC LIMIT 12
         """, (user_id, guild_id))
         rows = await cur.fetchall()
-
     rows.reverse()
-    return [{"role": role, "content": content} for role, content in rows]
+    return [{"role": r, "content": c} for r, c in rows]
 
-async def load_profile_text(user_id):
+
+async def load_profile(user_id) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-        SELECT nickname, language, favorite_game
-        FROM profiles
-        WHERE user_id=?
-        """, (user_id,))
+        cur = await db.execute(
+            "SELECT nickname, language, favorite_game, age, bio FROM profiles WHERE user_id=?",
+            (user_id,)
+        )
         row = await cur.fetchone()
-
     if not row:
         return ""
-
-    nickname, language, favorite_game = row
-    parts = []
-    if nickname:
-        parts.append(f"Nickname: {nickname}")
-    if language:
-        parts.append(f"Language: {language}")
-    if favorite_game:
-        parts.append(f"Favorite Game: {favorite_game}")
-
-    return "\n".join(parts)
+    keys = ["Nickname", "Language", "Favorite Game", "Age", "Bio"]
+    return "\n".join(f"{k}: {v}" for k, v in zip(keys, row) if v)
 
 # ==================================================
-# RESPONSE SENDER
+# WARNINGS DB
 # ==================================================
 
-async def send_long_message(channel, text, reply_to=None):
-    if not text:
+async def add_warning(user_id, guild_id, reason, moderator_id) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO warnings (user_id, guild_id, reason, moderator_id) VALUES (?,?,?,?)",
+            (user_id, guild_id, reason, moderator_id)
+        )
+        await db.commit()
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE user_id=? AND guild_id=?",
+            (user_id, guild_id)
+        )
+        return (await cur.fetchone())[0]
+
+
+async def get_warnings(user_id, guild_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, reason, moderator_id, created_at FROM warnings "
+            "WHERE user_id=? AND guild_id=? ORDER BY id",
+            (user_id, guild_id)
+        )
+        return await cur.fetchall()
+
+
+async def remove_warning(warning_id, guild_id) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM warnings WHERE id=? AND guild_id=?", (warning_id, guild_id)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def clear_warnings(user_id, guild_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM warnings WHERE user_id=? AND guild_id=?", (user_id, guild_id))
+        await db.commit()
+
+# ==================================================
+# MOD LOG
+# ==================================================
+
+async def send_mod_log(guild: discord.Guild, embed: discord.Embed):
+    cid = mod_log_channels.get(guild.id)
+    if not cid:
         return
+    ch = guild.get_channel(cid)
+    if ch:
+        try:
+            await ch.send(embed=embed)
+        except:
+            pass
 
-    chunks = [text[i:i+1900] for i in range(0, len(text), 1900)]
-    if not chunks:
-        chunks = ["(empty response)"]
 
-    first = True
-    for chunk in chunks:
-        if first and reply_to is not None:
-            await reply_to.reply(chunk, mention_author=False)
-            first = False
-        else:
-            await channel.send(chunk)
+def make_embed(title: str, color: discord.Color, fields: dict,
+               user: discord.Member = None) -> discord.Embed:
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.datetime.utcnow())
+    if user:
+        embed.set_thumbnail(url=user.display_avatar.url)
+    for name, value in fields.items():
+        embed.add_field(name=name, value=str(value), inline=len(str(value)) < 40)
+    return embed
 
 # ==================================================
-# PUNISHMENT
+# AUTOMOD PUNISHMENTS
 # ==================================================
 
-def timeout_minutes_for(category):
-    return {
-        "SPAM": 5,
-        "TOXIC": 10,
-        "HARASSMENT": 30,
-        "SCAM": 60,
-        "EXTREME": 1440,
-    }.get(category, 10)
+async def log_automod(guild_id, user_id, action, reason):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO automod_log (guild_id, user_id, action, reason) VALUES (?,?,?,?)",
+            (guild_id, user_id, action, reason)
+        )
+        await db.commit()
 
-async def punish(member, category):
-    warnings_key = (member.guild.id, member.id)
-    warning_counts[warnings_key] += 1
-    warnings = warning_counts[warnings_key]
-    minutes = timeout_minutes_for(category)
+
+async def auto_ban(member: discord.Member, reason: str):
+    try:
+        await member.send(f"You have been **banned** from **{member.guild.name}**.\nReason: {reason}")
+    except:
+        pass
+    try:
+        await member.ban(reason=reason)
+    except:
+        return
+    await log_automod(member.guild.id, member.id, "BAN", reason)
+    embed = make_embed(
+        "🔨 Auto-Ban", discord.Color.red(),
+        {"User": f"{member.mention} (`{member.id}`)", "Reason": reason},
+        user=member
+    )
+    await send_mod_log(member.guild, embed)
+
+
+async def punish(member: discord.Member, category: str):
+    minutes = TIMEOUT_DURATIONS.get(category, 10)
+    total   = await add_warning(member.id, member.guild.id, category, bot.user.id)
 
     try:
-        await member.timeout(
-            datetime.timedelta(minutes=minutes),
-            reason=f"StarGPT moderation: {category}"
-        )
+        await member.timeout(datetime.timedelta(minutes=minutes), reason=f"AutoMod: {category}")
     except:
         pass
 
     try:
         await member.send(
-            f"Moderation Action\n\nCategory: {category}\nWarnings: {warnings}/3\nTimeout: {minutes} minutes"
+            f"**⚠️ AutoMod Action — {member.guild.name}**\n"
+            f"Violation: `{category}`\n"
+            f"Timeout: {minutes} minute(s)\n"
+            f"Warnings: `{total}/{MAX_WARNINGS}`"
         )
     except:
         pass
 
+    await log_automod(member.guild.id, member.id, "TIMEOUT", category)
+
+    embed = make_embed(
+        "🤖 AutoMod Action", discord.Color.orange(),
+        {"User": f"{member.mention} (`{member.id}`)",
+         "Violation": category,
+         "Timeout": f"{minutes} min",
+         "Warnings": f"{total}/{MAX_WARNINGS}"},
+        user=member
+    )
+    await send_mod_log(member.guild, embed)
+
+    if total >= MAX_WARNINGS:
+        await auto_ban(member, f"Reached {MAX_WARNINGS} warnings. Last: {category}")
+
 # ==================================================
-# COMMANDS
+# IMAGE FETCH
 # ==================================================
 
-@bot.tree.command(name="setup")
-@app_commands.checks.has_permissions(administrator=True)
-async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO guild_settings (guild_id, personality) VALUES (?, 'friendly')",
-            (interaction.guild.id,)
-        )
-        await db.execute(
-            "INSERT OR IGNORE INTO ai_channels (guild_id, channel_id) VALUES (?, ?)",
-            (interaction.guild.id, channel.id)
-        )
-        await db.commit()
+async def fetch_image_b64(url: str) -> tuple:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            data = await resp.read()
+            mime = resp.content_type or "image/png"
+            return base64.b64encode(data).decode(), mime
 
-    setup_channels[interaction.guild.id].add(channel.id)
-    await interaction.response.send_message(f"AI channel added: {channel.mention}")
+# ==================================================
+# MESSAGE SENDER
+# ==================================================
 
-@bot.tree.command(name="removechannel")
-@app_commands.checks.has_permissions(administrator=True)
-async def removechannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM ai_channels WHERE guild_id=? AND channel_id=?",
-            (interaction.guild.id, channel.id)
-        )
-        await db.commit()
-
-    if interaction.guild.id in setup_channels:
-        setup_channels[interaction.guild.id].discard(channel.id)
-
-    await interaction.response.send_message(f"AI channel removed: {channel.mention}")
-
-@bot.tree.command(name="personality")
-@app_commands.checks.has_permissions(administrator=True)
-async def personality(interaction: discord.Interaction, style: str):
-    style = style.lower().strip()
-    if style not in VALID_STYLES:
-        await interaction.response.send_message(
-            f"Invalid style. Use one of: {', '.join(sorted(VALID_STYLES))}",
-            ephemeral=True
-        )
+async def send_chunked(channel, text, reply_to=None):
+    if not text:
         return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        INSERT INTO guild_settings (guild_id, personality)
-        VALUES (?, ?)
-        ON CONFLICT(guild_id) DO UPDATE SET personality=excluded.personality
-        """, (interaction.guild.id, style))
-        await db.commit()
-
-    guild_styles[interaction.guild.id] = style
-    await interaction.response.send_message(f"Personality set to: {style}")
-
-@bot.tree.command(name="remember")
-async def remember(interaction: discord.Interaction, key: str, value: str):
-    key = key.lower().strip()
-
-    if key not in VALID_PROFILE_KEYS:
-        await interaction.response.send_message(
-            f"Invalid key. Use: {', '.join(sorted(VALID_PROFILE_KEYS))}",
-            ephemeral=True
-        )
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT user_id FROM profiles WHERE user_id=?",
-            (interaction.user.id,)
-        )
-        exists = await cur.fetchone()
-
-        if exists:
-            await db.execute(
-                f"UPDATE profiles SET {key}=? WHERE user_id=?",
-                (value, interaction.user.id)
-            )
+    chunks = [text[i:i+1900] for i in range(0, len(text), 1900)] or ["…"]
+    for i, chunk in enumerate(chunks):
+        if i == 0 and reply_to:
+            await reply_to.reply(chunk, mention_author=False)
         else:
-            data = {
-                "nickname": None,
-                "language": None,
-                "favorite_game": None,
-            }
-            data[key] = value
-            await db.execute(
-                "INSERT INTO profiles (user_id, nickname, language, favorite_game) VALUES (?, ?, ?, ?)",
-                (interaction.user.id, data["nickname"], data["language"], data["favorite_game"])
-            )
-
-        await db.commit()
-
-    await interaction.response.send_message(f"Saved {key}: {value}")
-
-@bot.tree.command(name="appeal")
-async def appeal(interaction: discord.Interaction, reason: str):
-    await interaction.response.defer(ephemeral=True)
-    decision = await ai_appeal_review(reason)
-
-    if decision == "APPROVE":
-        await interaction.followup.send("Appeal approved.")
-    else:
-        await interaction.followup.send("Appeal denied.")
+            await channel.send(chunk)
 
 # ==================================================
-# ANTI RAID
+# SLASH COMMANDS — SETUP
 # ==================================================
 
-@bot.event
-async def on_member_join(member):
-    guild_id = member.guild.id
-    now = time.time()
-
-    join_tracker[guild_id].append(now)
-    recent = [t for t in join_tracker[guild_id] if now - t < 15]
-    join_tracker[guild_id] = recent
-
-    if len(recent) >= 10:
-        try:
-            await member.guild.edit(verification_level=discord.VerificationLevel.high)
-        except:
-            pass
-
-    suspicious = False
-    account_age_days = (discord.utils.utcnow() - member.created_at).days
-
-    if account_age_days < 7:
-        suspicious = True
-    if member.avatar is None:
-        suspicious = True
-
-    if suspicious:
-        try:
-            await member.timeout(
-                datetime.timedelta(minutes=30),
-                reason="Suspicious account"
-            )
-        except:
-            pass
-
-# ==================================================
-# MESSAGE EVENT
-# ==================================================
-
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
-
-    if not message.guild:
-        return
-
-    if not message.content or not message.content.strip():
-        return
-
-    channel_ids = setup_channels.get(message.guild.id)
-    if not channel_ids:
-        return
-
-    if message.channel.id not in channel_ids:
-        return
-
-    chat_key = (message.guild.id, message.author.id, message.channel.id)
-    if chat_key in active_chats:
-        return
-
-    active_chats.add(chat_key)
-
-    try:
-        async with message.channel.typing():
-            mod = await ai_moderation(message.content)
-
-            if mod != "SAFE":
-                try:
-                    await message.delete()
-                except:
-                    pass
-
-                await punish(message.author, mod)
-                return
-
-            personality_style = guild_styles.get(message.guild.id, "friendly")
-            profile_text = await load_profile_text(message.author.id)
-            memory = await load_memory(message.author.id, message.guild.id)
-
-            style_prompt = {
-                "friendly": "Be warm, helpful, and clear.",
-                "serious": "Be concise, direct, and professional.",
-                "funny": "Be playful, witty, and friendly, but still helpful.",
-                "anime": "Be energetic, expressive, and friendly like an anime-style assistant."
-            }.get(personality_style, "Be warm, helpful, and clear.")
-
-            system_prompt = f"""
-You are StarGPT, a Discord assistant.
-
-Style:
-{style_prompt}
-
-Rules:
-- Keep replies short unless the user asks for detail.
-- Be natural in Discord chat.
-- Do not mention that you are an AI unless asked.
-"""
-
-            if profile_text:
-                system_prompt += f"\n\nUser profile:\n{profile_text}\n"
-
-            messages = [{"role": "system", "content": system_prompt}]
-            messages.extend(memory)
-            messages.append({"role": "user", "content": message.content})
-
-            response = await generate_ai(messages)
-
-            await save_memory(message.author.id, message.guild.id, "user", message.content)
-            await save_memory(message.author.id, message.guild.id, "assistant", response)
-
-            await send_long_message(message.channel, response, reply_to=message)
-
-    finally:
-        active_chats.discard(chat_key)
-
-# ==================================================
-# READY
-# ==================================================
-
-_ready_done = False
-
-@bot.event
-async def on_ready():
-    global _ready_done
-
-    await setup_database()
-    await load_cache()
-
-    if not _ready_done:
-        try:
-            synced = await bot.tree.sync()
-            print(f"Synced {len(synced)} commands")
-        except Exception as e:
-            print(f"Command sync error: {e}")
-        _ready_done = True
-
-    print(f"Logged in as {bot.user}")
-
-# ==================================================
-# RUN
-# ==================================================
-
-bot.run(DISCORD_TOKEN)
+@bot.tree.command(name="setup", description="Add a channel where StarGPT will chat.")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_setup(interaction: discord.Interaction, channel: discord.TextChannel):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
+        await db.execute(
+            "INSERT OR IGNORE INTO ai_channels (guild_id, channel_id) VAL
