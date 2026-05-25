@@ -11,19 +11,17 @@ import time
 from flask import Flask
 import threading
 
-# --- 🌐 1. FLASK SETUP (MAHALAGA PARA SA FREE RENDER WEB SERVICE) ---
+# --- 🌐 1. FLASK SETUP (for Render Free Tier) ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    # Ito ang babasahin ni Render para makitang "HEALTHY" at "ALIVE" ang service mo
     return "StarGPT is running online on Render Free Tier! ⭐", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# Papatakbuhin muna natin ang Flask sa isang hiwalay na Thread bago mag-load si Discord
 print("🌐 Starting Flask Web Server...")
 flask_thread = threading.Thread(target=run_flask)
 flask_thread.daemon = True
@@ -127,7 +125,7 @@ async def on_member_join(member):
         except Exception:
             pass
 
-# --- 🧠 UNIFIED AI GATEWAY (Gemini -> Groq llama-3.1-8b-instant) ---
+# --- 🧠 UNIFIED AI GATEWAY ---
 def get_ai_response(prompt_text, system_instruction, full_context_list=None):
     try:
         contents = full_context_list if full_context_list else [prompt_text]
@@ -161,7 +159,7 @@ def get_ai_response(prompt_text, system_instruction, full_context_list=None):
             print(f"❌ Both Engines Failed: {groq_err}")
             return "Sorry, I am having trouble connecting to my AI engines right now.", "None"
 
-# --- 🛡️ FIXED MESSAGE ROUTER ---
+# --- 🛡️ MAIN MESSAGE HANDLER ---
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -172,7 +170,6 @@ async def on_message(message):
     current_time = time.time()
     if user_id not in user_msg_times:
         user_msg_times[user_id] = []
-        
     user_msg_times[user_id] = [t for t in user_msg_times[user_id] if current_time - t < 4]
     user_msg_times[user_id].append(current_time)
     
@@ -193,39 +190,68 @@ async def on_message(message):
             except Exception:
                 pass
 
-    # 3. COMBINED AI PROCESSING
+    # 3. AI CHAT CHANNEL PROCESSING
     guild_id = message.guild.id if message.guild else None
     if guild_id and ai_channels.get(guild_id) == message.channel.id:
         async with message.channel.typing():
             try:
+                # Toxicity Check
                 mod_prompt = f"Analyze this message. Reply ONLY with 'TOXIC' if it contains extreme profanity, severe insults, or heavy harassment. Reply 'SAFE' if normal: \"{message.content}\""
                 mod_reply, _ = get_ai_response(mod_prompt, "You are a strict server auto-moderator.")
                 
                 if "TOXIC" in mod_reply.upper():
                     await message.delete()
                     warnings = add_warning(user_id, guild_id)
+                    
                     if warnings == 1:
                         await message.channel.send(f"⚠️ {message.author.mention}, [Warning 1/3] Clean up your language!", delete_after=10)
                     elif warnings == 2:
                         await message.channel.send(f"⚠️ {message.author.mention}, [Warning 2/3] Final warning!", delete_after=10)
                     elif warnings >= 3:
-                        if warnings == 3:
-                            set_punishment(user_id, guild_id, "KICK")
-                            await message.channel.send(f"👢 {message.author.mention} has been **KICKED** for getting 3 warnings.")
-                            await message.guild.kick(message.author, reason="3 Auto-Mod Warnings.")
-                        else:
-                            set_punishment(user_id, guild_id, "BAN")
-                            await message.channel.send(f"🔨 {message.author.mention} has been permanently **BANNED**.")
-                            await message.guild.ban(message.author, reason="Continuous Toxicity.")
+                        try:
+                            if warnings == 3:  # KICK
+                                set_punishment(user_id, guild_id, "KICK")
+                                
+                                dm_message = (
+                                    f"👢 **You have been kicked** from **{message.guild.name}**\n\n"
+                                    f"**Reason:** You received 3 warnings for toxic / inappropriate behavior.\n"
+                                    f"You can rejoin and use `/appeal` if you want to appeal this decision."
+                                )
+                                try:
+                                    await message.author.send(dm_message)
+                                except:
+                                    pass  # DMs closed
+                                
+                                await message.channel.send(f"👢 {message.author.mention} has been **KICKED** (3 warnings).")
+                                await message.guild.kick(message.author, reason="3 Auto-Mod Warnings.")
+                                
+                            else:  # BAN
+                                set_punishment(user_id, guild_id, "BAN")
+                                
+                                dm_message = (
+                                    f"🔨 **You have been banned** from **{message.guild.name}**\n\n"
+                                    f"**Reason:** Repeated toxic behavior after multiple warnings.\n"
+                                    f"You may still submit an appeal using `/appeal` command."
+                                )
+                                try:
+                                    await message.author.send(dm_message)
+                                except:
+                                    pass
+                                
+                                await message.channel.send(f"🔨 {message.author.mention} has been permanently **BANNED**.")
+                                await message.guild.ban(message.author, reason="Continuous Toxicity.")
+                        except Exception as e:
+                            print(f"Error during punishment: {e}")
                     return 
 
+                # Normal AI Response
                 if user_id not in user_memories:
                     user_memories[user_id] = []
 
                 system_instruction = (
                     "Your name is StarGPT. You are a highly intelligent, witty, and adaptive AI assistant. "
                     "CRITICAL RULE: Mirror and adapt to the user's language, slang, and style completely. "
-                    "Match their energy—be cool, friendly, and engaging. Avoid pre-pending 'AI:' to your responses. "
+                    "Match their energy—be cool, friendly, and engaging. "
                     f"You are speaking to '{message.author.display_name}' in the server '{message.guild.name}'."
                 )
 
@@ -242,7 +268,6 @@ async def on_message(message):
 
                 full_context = user_memories[user_id] + contents
                 response_text, provider_used = get_ai_response(prompt_text, system_instruction, full_context)
-                print(f"[LOG] Engine used for StarGPT: {provider_used}")
 
                 user_memories[user_id].append(prompt_text)
                 user_memories[user_id].append(f"AI: {response_text}")
@@ -275,7 +300,7 @@ async def toggle_raid(interaction: discord.Interaction, status: bool):
     state = "ENABLED 🔒" if RAID_MODE_ACTIVE else "DISABLED 🔓"
     await interaction.response.send_message(f"🛡️ Anti-Raid Mode has been manually **{state}**.")
 
-@bot.tree.command(name="appeal", description="Appeal your kick or ban. StarGPT AI will evaluate your reason.")
+@bot.tree.command(name="appeal", description="Appeal your kick or ban.")
 async def appeal(interaction: discord.Interaction, reason: str):
     await interaction.response.defer(ephemeral=True)
     user_id = interaction.user.id
@@ -288,7 +313,7 @@ async def appeal(interaction: discord.Interaction, reason: str):
     guild = bot.get_guild(guild_id)
     ai_prompt = (
         f"Analyze this appeal for a {punish_type}. The user's reason is: \"{reason}\". "
-        "Reply exactly with 'ACCEPT' or 'REJECT' at the start, followed by an explanation directly to the user."
+        "Reply exactly with 'ACCEPT' or 'REJECT' at the start, followed by an explanation."
     )
     
     ai_reply, _ = get_ai_response(ai_prompt, "You are StarGPT acting as a fair server judge.")
@@ -296,15 +321,17 @@ async def appeal(interaction: discord.Interaction, reason: str):
     if ai_reply.startswith("ACCEPT"):
         feedback = ai_reply.replace("ACCEPT", "").strip()
         if punish_type == "BAN" and guild:
-            try: await guild.unban(discord.Object(id=user_id))
-            except Exception: pass
+            try: 
+                await guild.unban(discord.Object(id=user_id))
+            except Exception: 
+                pass
         reset_warnings(user_id, guild_id)
         await interaction.followup.send(f"✅ **Appeal Approved!**\n\n{feedback}", ephemeral=True)
     else:
         feedback = ai_reply.replace("REJECT", "").strip()
         await interaction.followup.send(f"❌ **Appeal Denied.**\n\n{feedback}", ephemeral=True)
 
-# --- 🚀 3. BOT STARTUP EXECUTION ---
+# --- 🚀 BOT STARTUP ---
 if __name__ == "__main__":
     TOKEN = os.environ.get("DISCORD_TOKEN")
     if TOKEN:
