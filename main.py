@@ -17,6 +17,7 @@ from discord import app_commands
 # ==================================================
 # WEB SERVER
 # ==================================================
+
 app = Flask(__name__)
 
 @app.route("/")
@@ -34,6 +35,7 @@ Thread(target=run_web, daemon=True).start()
 # ==================================================
 # ENV
 # ==================================================
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -42,7 +44,9 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 # ==================================================
 # BOT
 # ==================================================
+
 intents = discord.Intents.all()
+intents.message_content = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -52,13 +56,18 @@ bot = commands.Bot(
 # ==================================================
 # STORAGE
 # ==================================================
+
 warning_counts = defaultdict(int)
 setup_channels = {}
 join_tracker = defaultdict(list)
 
+# FIX DUPLICATE CHAT
+active_chats = set()
+
 # ==================================================
 # DATABASE
 # ==================================================
+
 async def setup_database():
 
     async with aiosqlite.connect("stargpt.db") as db:
@@ -94,6 +103,7 @@ async def setup_database():
 # ==================================================
 # AI CHAT
 # ==================================================
+
 SYSTEM_PROMPT = """
 You are StarGPT.
 
@@ -118,6 +128,7 @@ async def generate_ai(messages):
 # ==================================================
 # MEMORY
 # ==================================================
+
 async def save_memory(
     user_id,
     guild_id,
@@ -178,6 +189,7 @@ async def load_memory(
 # ==================================================
 # AI MODERATION
 # ==================================================
+
 async def ai_moderation(text):
 
     def run():
@@ -197,12 +209,6 @@ SCAM
 TOXIC
 HARASSMENT
 EXTREME
-
-EXTREME includes:
-- severe harassment
-- hate speech
-- threats
-- dangerous scams
 """
                 },
                 {
@@ -220,6 +226,7 @@ EXTREME includes:
 # ==================================================
 # AI APPEAL REVIEW
 # ==================================================
+
 async def ai_appeal_review(reason):
 
     def run():
@@ -229,21 +236,9 @@ async def ai_appeal_review(reason):
                 {
                     "role": "system",
                     "content": """
-You are an appeal review AI.
-
 Reply ONLY with:
 APPROVE
 DENY
-
-Approve if:
-- user appears honest
-- punishment was too harsh
-- accidental behavior
-
-Deny if:
-- repeated abuse
-- scams
-- severe toxicity
 """
                 },
                 {
@@ -259,14 +254,15 @@ Deny if:
     return result.choices[0].message.content.strip().upper()
 
 # ==================================================
-# STREAMING RESPONSE
+# STREAM RESPONSE
 # ==================================================
+
 async def stream_response(
     message,
     response
 ):
 
-    msg = await message.reply("Thinking...")
+    msg = await message.channel.send("Thinking...")
 
     partial = ""
 
@@ -286,6 +282,7 @@ async def stream_response(
 # ==================================================
 # PUNISHMENT SYSTEM
 # ==================================================
+
 async def punish(member, category):
 
     key = (
@@ -334,9 +331,6 @@ Moderation Action
 Category: {category}
 Warnings: {warnings}/3
 Timeout: {duration} minutes
-
-Use:
-/appeal your_reason
 """
         )
     except:
@@ -345,6 +339,7 @@ Use:
 # ==================================================
 # ANTI RAID
 # ==================================================
+
 @bot.event
 async def on_member_join(member):
 
@@ -368,32 +363,10 @@ async def on_member_join(member):
         except:
             pass
 
-    account_age = (
-        discord.utils.utcnow()
-        - member.created_at
-    ).days
-
-    suspicious = False
-
-    if account_age < 7:
-        suspicious = True
-
-    if member.avatar is None:
-        suspicious = True
-
-    if suspicious:
-
-        try:
-            await member.timeout(
-                datetime.timedelta(minutes=30),
-                reason="Suspicious account"
-            )
-        except:
-            pass
-
 # ==================================================
 # SETUP COMMAND
 # ==================================================
+
 @bot.tree.command(name="setup")
 @app_commands.checks.has_permissions(
     administrator=True
@@ -412,128 +385,17 @@ async def setup(
     )
 
 # ==================================================
-# REMEMBER COMMAND
-# ==================================================
-@bot.tree.command(name="remember")
-async def remember(
-    interaction: discord.Interaction,
-    key: str,
-    value: str
-):
-
-    async with aiosqlite.connect("stargpt.db") as db:
-
-        cursor = await db.execute("""
-        SELECT *
-        FROM profiles
-        WHERE user_id=?
-        """, (
-            interaction.user.id,
-        ))
-
-        exists = await cursor.fetchone()
-
-        if exists:
-
-            if key == "nickname":
-
-                await db.execute("""
-                UPDATE profiles
-                SET nickname=?
-                WHERE user_id=?
-                """, (
-                    value,
-                    interaction.user.id
-                ))
-
-            elif key == "language":
-
-                await db.execute("""
-                UPDATE profiles
-                SET language=?
-                WHERE user_id=?
-                """, (
-                    value,
-                    interaction.user.id
-                ))
-
-            elif key == "favorite_game":
-
-                await db.execute("""
-                UPDATE profiles
-                SET favorite_game=?
-                WHERE user_id=?
-                """, (
-                    value,
-                    interaction.user.id
-                ))
-
-        else:
-
-            await db.execute("""
-            INSERT INTO profiles
-            VALUES (?, ?, ?, ?)
-            """, (
-                interaction.user.id,
-                value if key == "nickname" else None,
-                value if key == "language" else None,
-                value if key == "favorite_game" else None,
-            ))
-
-        await db.commit()
-
-    await interaction.response.send_message(
-        f"Saved {key}: {value}"
-    )
-
-# ==================================================
-# APPEAL COMMAND
-# ==================================================
-@bot.tree.command(name="appeal")
-async def appeal(
-    interaction: discord.Interaction,
-    reason: str
-):
-
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
-    decision = await ai_appeal_review(
-        reason
-    )
-
-    if decision == "APPROVE":
-
-        try:
-            await interaction.user.timeout(
-                None,
-                reason="AI approved appeal"
-            )
-        except:
-            pass
-
-        await interaction.followup.send(
-            "Your appeal was approved."
-        )
-
-    else:
-
-        await interaction.followup.send(
-            "Your appeal was denied."
-        )
-
-# ==================================================
 # MESSAGE EVENT
 # ==================================================
+
 @bot.event
 async def on_message(message):
 
+    # Ignore bots
     if message.author.bot:
         return
 
-    await bot.process_commands(message)
-
+    # Ignore DMs
     if not message.guild:
         return
 
@@ -541,47 +403,65 @@ async def on_message(message):
         message.guild.id
     )
 
-    # Channel Lock
-    if allowed_channel:
+    # ==================================================
+    # AI TRIGGER
+    # ==================================================
 
-        if (
-            message.channel.id != allowed_channel
-            and bot.user in message.mentions
-        ):
+    should_reply = False
 
-            await message.reply(
-                f"Use <#{allowed_channel}> for AI chat."
+    if bot.user in message.mentions:
+        should_reply = True
+
+    elif (
+        allowed_channel
+        and message.channel.id == allowed_channel
+    ):
+        should_reply = True
+
+    if not should_reply:
+        return
+
+    # ==================================================
+    # FIX DUPLICATE REPLIES
+    # ==================================================
+
+    chat_key = (
+        message.guild.id,
+        message.author.id
+    )
+
+    if chat_key in active_chats:
+        return
+
+    active_chats.add(chat_key)
+
+    try:
+
+        # ==================================================
+        # MODERATION
+        # ==================================================
+
+        moderation_result = await ai_moderation(
+            message.content
+        )
+
+        if moderation_result != "SAFE":
+
+            try:
+                await message.delete()
+            except:
+                pass
+
+            await punish(
+                message.author,
+                moderation_result
             )
 
             return
 
-    # AI Moderation
-    moderation_result = await ai_moderation(
-        message.content
-    )
-
-    if moderation_result != "SAFE":
-
-        try:
-            await message.delete()
-        except:
-            pass
-
-        await punish(
-            message.author,
-            moderation_result
-        )
-
-        return
-
-    # AI Chat
-    if (
-        bot.user in message.mentions
-        or (
-            allowed_channel
-            and message.channel.id == allowed_channel
-        )
-    ):
+        # ==================================================
+        # CLEAN PROMPT
+        # ==================================================
 
         prompt = message.content
 
@@ -592,6 +472,10 @@ async def on_message(message):
                 "",
                 prompt
             ).strip()
+
+        # ==================================================
+        # PROFILE
+        # ==================================================
 
         profile_text = ""
 
@@ -615,11 +499,15 @@ async def on_message(message):
 
             nickname, language, favorite_game = profile
 
-            profile_text = f'''
+            profile_text = f"""
 Nickname: {nickname}
 Language: {language}
 Favorite Game: {favorite_game}
-'''
+"""
+
+        # ==================================================
+        # MEMORY
+        # ==================================================
 
         memory = await load_memory(
             message.author.id,
@@ -641,9 +529,17 @@ Favorite Game: {favorite_game}
             "content": prompt
         })
 
+        # ==================================================
+        # AI RESPONSE
+        # ==================================================
+
         response = await generate_ai(
             messages
         )
+
+        # ==================================================
+        # SAVE MEMORY
+        # ==================================================
 
         await save_memory(
             message.author.id,
@@ -659,21 +555,31 @@ Favorite Game: {favorite_game}
             response
         )
 
+        # ==================================================
+        # SEND RESPONSE
+        # ==================================================
+
         await stream_response(
             message,
             response
         )
 
+    finally:
+
+        active_chats.discard(chat_key)
+
 # ==================================================
 # READY EVENT
 # ==================================================
+
 @bot.event
 async def on_ready():
 
     await setup_database()
 
     try:
-        await bot.tree.sync()
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} commands")
     except Exception as e:
         print(e)
 
@@ -682,4 +588,5 @@ async def on_ready():
 # ==================================================
 # START BOT
 # ==================================================
+
 bot.run(DISCORD_TOKEN)
