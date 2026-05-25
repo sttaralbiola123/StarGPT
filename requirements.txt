@@ -1,4 +1,4 @@
 discord.py
+google-genai
 groq
-Flask
-aiosqlite
+pillow
