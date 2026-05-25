@@ -3,3 +3,4 @@ google-genai
 groq
 pillow
 flask
+aiosqlite
