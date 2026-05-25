@@ -9,21 +9,27 @@ import sqlite3
 import re
 import time
 from flask import Flask
-from threading import Thread
+import threading
 
-# --- 🌐 FLASK WEB SERVER FOR RENDER ---
+# --- 🌐 1. FLASK SETUP (MAHALAGA PARA SA FREE RENDER WEB SERVICE) ---
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "StarGPT is alive and running 24/7!"
+    # Ito ang babasahin ni Render para makitang "HEALTHY" at "ALIVE" ang service mo
+    return "StarGPT is running online on Render Free Tier! ⭐", 200
 
 def run_flask():
-    # Render automatically passes the PORT variable. Default to 8080 if not found.
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- 🤖 DISCORD BOT CONFIGURATION ---
+# Papatakbuhin muna natin ang Flask sa isang hiwalay na Thread bago mag-load si Discord
+print("🌐 Starting Flask Web Server...")
+flask_thread = threading.Thread(target=run_flask)
+flask_thread.daemon = True
+flask_thread.start()
+
+# --- 🤖 2. DISCORD BOT CONFIGURATION ---
 intents = discord.Intents.default()
 intents.message_content = True  
 intents.members = True          
@@ -99,7 +105,7 @@ init_db()
 
 @bot.event
 async def on_ready():
-    print(f'⭐ StarGPT is now online! Logged in as {bot.user.name}')
+    print(f'⭐ StarGPT is now officially connected to Discord! Logged in as {bot.user.name}')
     try:
         await bot.tree.sync()
     except Exception as e:
@@ -155,13 +161,13 @@ def get_ai_response(prompt_text, system_instruction, full_context_list=None):
             print(f"❌ Both Engines Failed: {groq_err}")
             return "Sorry, I am having trouble connecting to my AI engines right now.", "None"
 
-# --- 🛡️ FIXED CHAT PROCESSING ENGINE ---
+# --- 🛡️ FIXED MESSAGE ROUTER ---
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
-    # 1. ANTI-SPAM CHECK
+    # 1. ANTI-SPAM
     user_id = message.author.id
     current_time = time.time()
     if user_id not in user_msg_times:
@@ -173,28 +179,25 @@ async def on_message(message):
     if len(user_msg_times[user_id]) > 4:
         try:
             await message.delete()
-            await message.channel.send(f"🤫 {message.author.mention}, chill ka lang! Bawal ang spamming. (Anti-Spam)", delete_after=5)
             return
         except Exception:
             pass
 
-    # 2. ANTI-LINKS CHECK
+    # 2. ANTI-LINKS
     url_pattern = re.compile(r'https?://[^\s]+|discord\.gg/[^\s]+')
     if url_pattern.search(message.content):
         if not message.author.guild_permissions.administrator:
             try:
                 await message.delete()
-                await message.channel.send(f"🚫 {message.author.mention}, links are restricted! (Anti-Links)", delete_after=5)
                 return
             except Exception:
                 pass
 
-    # 3. COMBINED AI CHAT & AUTO-MOD GATEWAY (FIXED: Isang tawag lang sa AI para walang duplicate replies)
+    # 3. COMBINED AI PROCESSING
     guild_id = message.guild.id if message.guild else None
     if guild_id and ai_channels.get(guild_id) == message.channel.id:
         async with message.channel.typing():
             try:
-                # Gagawa muna ng hiwalay na evaluation prompt para sa moderation para maging 100% tumpak
                 mod_prompt = f"Analyze this message. Reply ONLY with 'TOXIC' if it contains extreme profanity, severe insults, or heavy harassment. Reply 'SAFE' if normal: \"{message.content}\""
                 mod_reply, _ = get_ai_response(mod_prompt, "You are a strict server auto-moderator.")
                 
@@ -204,7 +207,7 @@ async def on_message(message):
                     if warnings == 1:
                         await message.channel.send(f"⚠️ {message.author.mention}, [Warning 1/3] Clean up your language!", delete_after=10)
                     elif warnings == 2:
-                        await message.channel.send(f"⚠️ {message.author.mention}, [Warning 2/3] Final warning before being kicked out!", delete_after=10)
+                        await message.channel.send(f"⚠️ {message.author.mention}, [Warning 2/3] Final warning!", delete_after=10)
                     elif warnings >= 3:
                         if warnings == 3:
                             set_punishment(user_id, guild_id, "KICK")
@@ -214,9 +217,8 @@ async def on_message(message):
                             set_punishment(user_id, guild_id, "BAN")
                             await message.channel.send(f"🔨 {message.author.mention} has been permanently **BANNED**.")
                             await message.guild.ban(message.author, reason="Continuous Toxicity.")
-                    return # Ihihinto rito para hindi na mag-reply ang normal AI Chat
+                    return 
 
-                # Kung SAFE ang message, dito na papasok ang normal na usapan kay StarGPT
                 if user_id not in user_memories:
                     user_memories[user_id] = []
 
@@ -238,12 +240,10 @@ async def on_message(message):
                 prompt_text = f"User ({message.author.display_name}): {message.content}"
                 contents.append(prompt_text)
 
-                # Dynamic memory generation
                 full_context = user_memories[user_id] + contents
                 response_text, provider_used = get_ai_response(prompt_text, system_instruction, full_context)
                 print(f"[LOG] Engine used for StarGPT: {provider_used}")
 
-                # Save exchange strictly once
                 user_memories[user_id].append(prompt_text)
                 user_memories[user_id].append(f"AI: {response_text}")
                 if len(user_memories[user_id]) > 12:  
@@ -288,8 +288,6 @@ async def appeal(interaction: discord.Interaction, reason: str):
     guild = bot.get_guild(guild_id)
     ai_prompt = (
         f"Analyze this appeal for a {punish_type}. The user's reason is: \"{reason}\". "
-        "If the response is short, low effort, or unrepentant, REJECT it immediately. "
-        "If it is thoughtful and holds genuine responsibility, ACCEPT it. "
         "Reply exactly with 'ACCEPT' or 'REJECT' at the start, followed by an explanation directly to the user."
     )
     
@@ -301,30 +299,16 @@ async def appeal(interaction: discord.Interaction, reason: str):
             try: await guild.unban(discord.Object(id=user_id))
             except Exception: pass
         reset_warnings(user_id, guild_id)
-        
-        invite_msg = ""
-        if guild:
-            try:
-                channels = [c for c in guild.channels if isinstance(c, discord.TextChannel)]
-                if channels:
-                    invite = await channels[0].create_invite(max_uses=1, unique=True)
-                    invite_msg = f"\nRejoin here: {invite.url}"
-            except Exception: pass
-                
-        await interaction.followup.send(f"✅ **Appeal Approved!**\n\n{feedback}{invite_msg}", ephemeral=True)
+        await interaction.followup.send(f"✅ **Appeal Approved!**\n\n{feedback}", ephemeral=True)
     else:
         feedback = ai_reply.replace("REJECT", "").strip()
         await interaction.followup.send(f"❌ **Appeal Denied.**\n\n{feedback}", ephemeral=True)
 
-# --- 🚀 RUNNING BOTH FLASK & DISCORD BOT ---
+# --- 🚀 3. BOT STARTUP EXECUTION ---
 if __name__ == "__main__":
-    # Start Flask thread first so Render recognizes the open port
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-
     TOKEN = os.environ.get("DISCORD_TOKEN")
     if TOKEN:
+        print("🚀 Connecting to Discord...")
         bot.run(TOKEN)
     else:
         print("CRITICAL ERROR: DISCORD_TOKEN environment variable is missing!")
