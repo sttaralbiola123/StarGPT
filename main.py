@@ -2,322 +2,406 @@ import os
 import discord
 from discord import app_commands
 from discord.ext import commands
-import google.generativeai as genai
-from groq import Groq
-import sqlite3
-import re
-import time
-import asyncio
 from flask import Flask
 import threading
-import io  # Important for image handling
+import sqlite3
+import asyncio
+import time
+import re
+import io
 
-# -------------------------
-# 🌐 FLASK KEEP ALIVE
-# -------------------------
+# =========================
+# 🌐 KEEP ALIVE
+# =========================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "StarGPT running ⭐", 200
+    return "StarGPT vCourt running ⚖️", 200
 
-def run_flask():
+def run():
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
 
-threading.Thread(target=run_flask, daemon=True).start()
+threading.Thread(target=run, daemon=True).start()
 
-# -------------------------
-# 🤖 BOT SETUP
-# -------------------------
+
+# =========================
+# 🤖 BOT
+# =========================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# -------------------------
+
+# =========================
 # 🔑 KEYS
-# -------------------------
+# =========================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+try:
+    from google import genai
+    from google.genai import types
+    gemini = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+except:
+    gemini = None
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq = None
+if GROQ_API_KEY:
+    from groq import Groq
+    groq = Groq(api_key=GROQ_API_KEY)
 
-# -------------------------
-# 🧠 MEMORY
-# -------------------------
-ai_channels = {}
-user_msg_times = {}
 
-# -------------------------
+# =========================
 # 🗄️ DATABASE
-# -------------------------
-DB_FILE = "data.db"
+# =========================
+DB = "data.db"
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS memory (
+        user_id INTEGER,
+        guild_id INTEGER,
+        text TEXT,
+        PRIMARY KEY(user_id, guild_id)
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS personality (
+        user_id INTEGER,
+        guild_id INTEGER,
+        traits TEXT,
+        PRIMARY KEY(user_id, guild_id)
+    )""")
+
     cur.execute("""CREATE TABLE IF NOT EXISTS warnings (
-        user_id INTEGER, guild_id INTEGER, count INTEGER,
-        PRIMARY KEY (user_id, guild_id)
+        user_id INTEGER,
+        guild_id INTEGER,
+        count INTEGER,
+        PRIMARY KEY(user_id, guild_id)
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS ai_channels (
-        guild_id INTEGER PRIMARY KEY, channel_id INTEGER
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS ai_channel (
+        guild_id INTEGER PRIMARY KEY,
+        channel_id INTEGER
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS user_memory (
-        user_id INTEGER, guild_id INTEGER, memory TEXT,
-        PRIMARY KEY (user_id, guild_id)
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS court_cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        guild_id INTEGER,
+        reason TEXT,
+        report TEXT,
+        verdict TEXT,
+        timestamp INTEGER
     )""")
+
     conn.commit()
     conn.close()
 
 init_db()
 
-# -------------------------
-# DB HELPERS
-# -------------------------
-def get_memory(uid, gid):
-    conn = sqlite3.connect(DB_FILE)
+
+# =========================
+# 🧠 MEMORY
+# =========================
+def get_memory(u, g):
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT memory FROM user_memory WHERE user_id=? AND guild_id=?", (uid, gid))
+    cur.execute("SELECT text FROM memory WHERE user_id=? AND guild_id=?", (u, g))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else ""
 
-def update_memory(uid, gid, new_text):
-    conn = sqlite3.connect(DB_FILE)
+def save_memory(u, g, t):
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO user_memory (user_id, guild_id, memory)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, guild_id)
-        DO UPDATE SET memory=excluded.memory
-    """, (uid, gid, new_text[-1500:]))
+    INSERT INTO memory VALUES (?, ?, ?)
+    ON CONFLICT(user_id, guild_id)
+    DO UPDATE SET text=excluded.text
+    """, (u, g, t[-1500:]))
     conn.commit()
     conn.close()
 
-def get_warnings(uid, gid):
-    conn = sqlite3.connect(DB_FILE)
+
+# =========================
+# 🧠 PERSONALITY
+# =========================
+def get_personality(u, g):
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT count FROM warnings WHERE user_id=? AND guild_id=?", (uid, gid))
+    cur.execute("SELECT traits FROM personality WHERE user_id=? AND guild_id=?", (u, g))
     row = cur.fetchone()
     conn.close()
-    return row[0] if row else 0
+    return row[0] if row else ""
 
-def add_warning(uid, gid):
-    val = get_warnings(uid, gid) + 1
-    conn = sqlite3.connect(DB_FILE)
+def update_personality(u, g, text):
+    existing = get_personality(u, g)
+
+    prompt = f"""
+Extract stable personality traits.
+
+Existing: {existing}
+New message: {text}
+
+Return only short traits.
+"""
+
+    try:
+        result = ai_sync(prompt)
+
+        conn = sqlite3.connect(DB)
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO personality VALUES (?, ?, ?)
+        ON CONFLICT(user_id, guild_id)
+        DO UPDATE SET traits=excluded.traits
+        """, (u, g, result[:200]))
+
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+
+# =========================
+# ⚠️ WARNINGS
+# =========================
+def get_warn(u, g):
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO warnings VALUES (?, ?, ?)", (uid, gid, val))
+    cur.execute("SELECT count FROM warnings WHERE user_id=? AND guild_id=?", (u, g))
+    r = cur.fetchone()
+    conn.close()
+    return r[0] if r else 0
+
+def add_warn(u, g):
+    c = get_warn(u, g) + 1
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO warnings VALUES (?, ?, ?)
+    ON CONFLICT(user_id, guild_id)
+    DO UPDATE SET count=excluded.count
+    """, (u, g, c))
     conn.commit()
     conn.close()
-    return val
+    return c
 
-# -------------------------
-# ⚡ AI TEXT FUNCTION
-# -------------------------
+
+# =========================
+# 🛡️ MOD CHECK
+# =========================
+def toxic(t):
+    return any(re.search(p, t.lower()) for p in [r"https?://", r"discord\.gg", r"@everyone", r"@here"])
+
+
+# =========================
+# 🤖 AI
+# =========================
 def ai_sync(prompt, image=None):
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        if image:
-            return model.generate_content([prompt, image]).text
-        return model.generate_content(prompt).text
-    except Exception:
-        try:
-            res = groq_client.chat.completions.create(
+        if gemini:
+            contents = [prompt]
+            if image:
+                contents.append(types.Part.from_bytes(image["data"], image["mime_type"]))
+            r = gemini.models.generate_content(model="gemini-2.5-flash", contents=contents)
+            return r.text or ""
+    except:
+        pass
+
+    try:
+        if groq:
+            r = groq.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=700
             )
-            return res.choices[0].message.content
-        except:
-            return "Sorry, may issue sa AI ngayon. Subukan mo ulit."
+            return r.choices[0].message.content
+    except:
+        pass
 
-async def get_ai(prompt, image=None):
-    return await asyncio.to_thread(ai_sync, prompt, image)
+    return "AI error."
 
-# -------------------------
-# 🎨 IMAGE GENERATION FUNCTION
-# -------------------------
-async def generate_image(prompt: str):
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash")  # Change if newer model available
-        response = await asyncio.to_thread(
-            model.generate_content,
-            f"Generate a high quality, detailed image: {prompt}",
-            generation_config={"response_modalities": ["IMAGE"]}
-        )
+async def get_ai(p, img=None):
+    return await asyncio.to_thread(ai_sync, p, img)
 
-        for part in response.parts:
-            if part.inline_data:
-                image_bytes = part.inline_data.data
-                return discord.File(io.BytesIO(image_bytes), filename="stargpt_image.png")
-        return None
-    except Exception as e:
-        print(f"Image generation error: {e}")
-        return None
 
-# -------------------------
-# 🛡️ AUTO MOD
-# -------------------------
-def is_toxic(content):
-    bad_patterns = [r"https?://", r"discord\.gg", r"@everyone", r"@here"]
-    if any(re.search(p, content.lower()) for p in bad_patterns):
-        return True
-    if len(content) > 250 and content.count("!!!") > 3:
-        return True
-    return False
+# =========================
+# ⚖️ COURT AI SYSTEM
+# =========================
+def court_ai(user_msg, warn, reason):
+    prompt = f"""
+You are an AI COURT SYSTEM.
 
-# -------------------------
-# 🤖 EVENTS
-# -------------------------
+PROSECUTOR: explain guilt
+DEFENDER: defend user
+JUDGE: choose one -> WARN / TIMEOUT / KICK / BAN / DISMISS
+
+User: {user_msg}
+Reason: {reason}
+Warnings: {warn}
+"""
+
+    res = ai_sync(prompt)
+
+    verdict = "DISMISS"
+    if "BAN" in res:
+        verdict = "BAN"
+    elif "KICK" in res:
+        verdict = "KICK"
+    elif "TIMEOUT" in res:
+        verdict = "TIMEOUT"
+    elif "WARN" in res:
+        verdict = "WARN"
+
+    return res, verdict
+
+
+# =========================
+# GLOBALS
+# =========================
+ai_channels = {}
+spam = {}
+
+
+# =========================
+# 🚀 EVENTS
+# =========================
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     await bot.tree.sync()
 
-    # Load AI Channels
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT guild_id, channel_id FROM ai_channels")
-    for row in cur.fetchall():
-        ai_channels[row[0]] = row[1]
-    conn.close()
-    print(f"Loaded {len(ai_channels)} AI channel(s)")
 
 @bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
+async def on_message(m):
+    if m.author.bot or not m.guild:
         return
 
-    uid = message.author.id
-    gid = message.guild.id
+    u = m.author.id
+    g = m.guild.id
     now = time.time()
 
-    # Spam Control
-    user_msg_times.setdefault(uid, [])
-    user_msg_times[uid] = [t for t in user_msg_times[uid] if now - t < 5]
-    user_msg_times[uid].append(now)
+    spam.setdefault(u, [])
+    spam[u] = [x for x in spam[u] if now - x < 5]
+    spam[u].append(now)
 
-    if len(user_msg_times[uid]) > 6:
-        await message.delete()
+    if len(spam[u]) > 6:
+        await m.delete()
         return
 
-    # Auto Mod
-    if is_toxic(message.content):
-        if not message.author.guild_permissions.administrator:
-            await message.delete()
-            warns = add_warning(uid, gid)
-            if warns >= 3:
-                try:
-                    await message.author.kick(reason="AutoMod limit reached")
-                except:
-                    pass
+    # AUTO MOD
+    if toxic(m.content) and not m.author.guild_permissions.administrator:
+        await m.delete()
+        w = add_warn(u, g)
+
+        if w >= 3:
+            try:
+                await m.author.kick(reason="AutoMod")
+            except:
+                pass
             return
 
     # AI CHANNEL
-    if ai_channels.get(gid) == message.channel.id:
-        image = None
-        if message.attachments:
-            att = message.attachments[0]
-            if att.content_type and "image" in att.content_type:
-                image_bytes = await att.read()
-                image = {"mime_type": att.content_type, "data": image_bytes}
+    if ai_channels.get(g) == m.channel.id:
 
-        memory = get_memory(uid, gid)
-        user_input = message.content.lower()
-
-        # Image Generation Detection
-        image_keywords = ["imagine", "gawin mo picture", "gumawa ng picture", "draw", 
-                         "larawan", "picture of", "image of", "generate image", 
-                         "mag generate ng", "gawa ng larawan"]
-
-        should_generate_image = any(keyword in user_input for keyword in image_keywords)
+        mem = get_memory(u, g)
+        per = get_personality(u, g)
 
         prompt = f"""
-You are StarGPT, a friendly, witty, and helpful Filipino AI assistant.
+You are StarGPT.
 
-User memory:
-{memory}
+PERSONALITY: {per}
+MEMORY: {mem}
 
-User message: {message.content}
-
-Reply naturally in Taglish when appropriate. Be fun and engaging.
+User: {m.content}
 """
 
-        async with message.channel.typing():
-            if should_generate_image:
-                reply_text = "Generating image for you... ⭐ Please wait."
-                await message.reply(reply_text)
+        async with m.channel.typing():
 
-                img_file = await generate_image(message.content)
+            if any(x in m.content.lower() for x in ["draw", "picture", "imagine"]):
+                await m.reply("Generating...")
+                return
 
-                if img_file:
-                    embed = discord.Embed(
-                        title="⭐ StarGPT Image",
-                        description=f"**Prompt:** {message.content[:500]}",
-                        color=0x00ffaa
-                    )
-                    await message.reply(embed=embed, file=img_file)
-                else:
-                    await message.reply("❌ Sorry, hindi ko magenerate ang image ngayon. Subukan mo ulit mamaya.")
-            else:
-                # Normal AI Reply
-                reply = await get_ai(prompt, image=image)
-                await message.reply(reply[:1900])
+            reply = await get_ai(prompt)
+            await m.reply(reply[:1900])
 
-        # Update Memory
-        new_memory = (memory + "\nUser: " + message.content)[-1500:]
-        update_memory(uid, gid, new_memory)
+        save_memory(u, g, (mem + "\n" + m.content)[-1500:])
+        update_personality(u, g, m.content)
 
-        return  # Prevent double processing
+        return
 
-    await bot.process_commands(message)
+    await bot.process_commands(m)
 
-# -------------------------
-# ⚙️ COMMANDS
-# -------------------------
-@bot.tree.command(name="setup", description="Set AI channel")
-@app_commands.checks.has_permissions(administrator=True)
-async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
-    conn = sqlite3.connect(DB_FILE)
+
+# =========================
+# ⚙️ SETUP
+# =========================
+@bot.tree.command(name="setup")
+async def setup(i: discord.Interaction, ch: discord.TextChannel):
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO ai_channels (guild_id, channel_id)
-        VALUES (?, ?)
-        ON CONFLICT(guild_id)
-        DO UPDATE SET channel_id=excluded.channel_id
-    """, (interaction.guild.id, channel.id))
+    INSERT INTO ai_channel VALUES (?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id
+    """, (i.guild.id, ch.id))
     conn.commit()
     conn.close()
 
-    ai_channels[interaction.guild.id] = channel.id
-    await interaction.response.send_message(f"✅ AI channel set to {channel.mention}", ephemeral=True)
+    ai_channels[i.guild.id] = ch.id
+    await i.response.send_message("AI channel set", ephemeral=True)
 
-@bot.tree.command(name="forget", description="Clear your conversation memory")
-async def forget(interaction: discord.Interaction):
-    update_memory(interaction.user.id, interaction.guild.id, "")
-    await interaction.response.send_message("🧹 Na-clear na ang memory mo with StarGPT.", ephemeral=True)
 
-@bot.tree.command(name="status", description="Check bot status")
-async def status(interaction: discord.Interaction):
-    embed = discord.Embed(title="⭐ StarGPT Status", color=0x00ffaa)
-    embed.add_field(name="Ping", value=f"{round(bot.latency*1000)}ms", inline=True)
-    embed.add_field(name="Servers", value=len(bot.guilds), inline=True)
-    embed.add_field(name="Status", value="Online ✅", inline=True)
-    await interaction.response.send_message(embed=embed)
+# =========================
+# ⚖️ COURT COMMAND
+# =========================
+@bot.tree.command(name="court")
+@app_commands.checks.has_permissions(administrator=True)
+async def court(i: discord.Interaction, user: discord.Member, reason: str):
 
-# -------------------------
-# 🚀 RUN BOT
-# -------------------------
+    mem = get_memory(user.id, i.guild.id)
+    warn = get_warn(user.id, i.guild.id)
+
+    report, verdict = court_ai(mem, warn, reason)
+
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO court_cases(user_id, guild_id, reason, report, verdict, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (user.id, i.guild.id, reason, report, verdict, int(time.time())))
+    conn.commit()
+    conn.close()
+
+    try:
+        if verdict == "BAN":
+            await user.ban(reason="AI Court")
+        elif verdict == "KICK":
+            await user.kick(reason="AI Court")
+        elif verdict == "WARN":
+            add_warn(user.id, i.guild.id)
+    except:
+        pass
+
+    embed = discord.Embed(title="⚖️ COURT VERDICT")
+    embed.add_field(name="User", value=user.mention)
+    embed.add_field(name="Verdict", value=verdict)
+    embed.add_field(name="Report", value=report[:1000])
+
+    await i.response.send_message(embed=embed)
+
+
+# =========================
+# 🚀 RUN
+# =========================
 if __name__ == "__main__":
-    print("Starting StarGPT v2 with Auto Image Gen...")
     if not DISCORD_TOKEN:
-        print("Missing DISCORD_TOKEN")
-        exit(1)
+        exit("Missing token")
     bot.run(DISCORD_TOKEN)
