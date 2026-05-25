@@ -7,30 +7,27 @@ from groq import Groq
 import sqlite3
 import re
 import time
+import asyncio
 from flask import Flask
 import threading
 
 # -------------------------
-# 🌐 FLASK KEEP-ALIVE
+# 🌐 FLASK KEEP ALIVE
 # -------------------------
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "StarGPT is running ⭐", 200
+    return "StarGPT running ⭐", 200
 
 def run_flask():
-    try:
-        port = int(os.environ.get("PORT", 8080))
-        print(f"✅ Flask starting on port {port}")
-        app.run(host="0.0.0.0", port=port, debug=False)
-    except Exception as e:
-        print(f"❌ Flask error: {e}")
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 threading.Thread(target=run_flask, daemon=True).start()
 
 # -------------------------
-# 🤖 DISCORD BOT SETUP
+# 🤖 BOT SETUP
 # -------------------------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -39,11 +36,11 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # -------------------------
-# 🔑 API KEYS (Ganito ang order mo)
+# 🔑 KEYS
 # -------------------------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -51,7 +48,7 @@ if GEMINI_API_KEY:
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # -------------------------
-# 📦 MEMORY
+# 🧠 MEMORY (RAM cache)
 # -------------------------
 ai_channels = {}
 user_msg_times = {}
@@ -64,28 +61,54 @@ DB_FILE = "data.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS warnings (
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS warnings (
         user_id INTEGER,
         guild_id INTEGER,
         count INTEGER,
         PRIMARY KEY (user_id, guild_id)
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS punishments (
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS ai_channels (
+        guild_id INTEGER PRIMARY KEY,
+        channel_id INTEGER
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS user_memory (
         user_id INTEGER,
         guild_id INTEGER,
-        type TEXT,
+        memory TEXT,
         PRIMARY KEY (user_id, guild_id)
-    )
-    """)
+    )""")
+
     conn.commit()
     conn.close()
 
 init_db()
 
-# DB Helpers
+# -------------------------
+# DB HELPERS
+# -------------------------
+def get_memory(uid, gid):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT memory FROM user_memory WHERE user_id=? AND guild_id=?", (uid, gid))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else ""
+
+def update_memory(uid, gid, new_text):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO user_memory (user_id, guild_id, memory)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, guild_id)
+        DO UPDATE SET memory=excluded.memory
+    """, (uid, gid, new_text))
+    conn.commit()
+    conn.close()
+
 def get_warnings(uid, gid):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -103,41 +126,56 @@ def add_warning(uid, gid):
     conn.close()
     return val
 
-def set_punishment(uid, gid, ptype):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO punishments VALUES (?, ?, ?)", (uid, gid, ptype))
-    conn.commit()
-    conn.close()
-
 # -------------------------
-# 🤖 AI FUNCTION
+# ⚡ AI FUNCTION (ASYNC FIXED)
 # -------------------------
-def get_ai(prompt):
+def ai_sync(prompt, image=None):
     try:
-        if GEMINI_API_KEY:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            res = model.generate_content(prompt)
-            return res.text or "No response"
-        
-        res = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.7
-        )
-        return res.choices[0].message.content
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return "AI error. Subukan mo ulit."
+        if image:
+            return model.generate_content([prompt, image]).text
+
+        return model.generate_content(prompt).text
+
+    except Exception:
+        try:
+            res = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500
+            )
+            return res.choices[0].message.content
+        except:
+            return "AI error."
+
+async def get_ai(prompt, image=None):
+    return await asyncio.to_thread(ai_sync, prompt, image)
 
 # -------------------------
-# EVENTS
+# 🛡️ AUTO MOD
+# -------------------------
+def is_toxic(content):
+    bad_patterns = [
+        r"https?://",
+        r"discord\.gg",
+        r"@everyone",
+        r"@here"
+    ]
+    if any(re.search(p, content.lower()) for p in bad_patterns):
+        return True
+
+    if len(content) > 250 and content.count("!!!") > 3:
+        return True
+
+    return False
+
+# -------------------------
+# 🤖 EVENTS
 # -------------------------
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    print(f"Logged in as {bot.user}")
     await bot.tree.sync()
 
 @bot.event
@@ -147,66 +185,110 @@ async def on_message(message):
 
     uid = message.author.id
     gid = message.guild.id
-
-    # Anti-Spam
     now = time.time()
+
+    # -------------------------
+    # SPAM CONTROL
+    # -------------------------
     user_msg_times.setdefault(uid, [])
-    user_msg_times[uid] = [t for t in user_msg_times[uid] if now - t < 4]
+    user_msg_times[uid] = [t for t in user_msg_times[uid] if now - t < 5]
     user_msg_times[uid].append(now)
 
-    if len(user_msg_times[uid]) > 5:
+    if len(user_msg_times[uid]) > 6:
         await message.delete()
         return
 
-    # Anti-Link
-    if re.search(r'https?://|discord\.gg', message.content):
+    # -------------------------
+    # AUTO MOD
+    # -------------------------
+    if is_toxic(message.content):
         if not message.author.guild_permissions.administrator:
-            if ai_channels.get(gid) != message.channel.id:
-                await message.delete()
-                return
+            await message.delete()
+            warns = add_warning(uid, gid)
 
-    # AI Channel
+            if warns >= 3:
+                try:
+                    await message.author.kick(reason="AutoMod limit reached")
+                except:
+                    pass
+            return
+
+    # -------------------------
+    # IMAGE SCAN
+    # -------------------------
+    image = None
+    if message.attachments:
+        att = message.attachments[0]
+        if att.content_type and "image" in att.content_type:
+            image_bytes = await att.read()
+            image = {
+                "mime_type": att.content_type,
+                "data": image_bytes
+            }
+
+    # -------------------------
+    # AI CHANNEL
+    # -------------------------
     if ai_channels.get(gid) == message.channel.id:
+
+        memory = get_memory(uid, gid)
+
+        prompt = f"""
+You are StarGPT AI.
+
+User memory:
+{memory}
+
+User message:
+{message.content}
+
+Reply naturally and helpfully.
+"""
+
         async with message.channel.typing():
-            mod_prompt = f"Classify as SAFE or TOXIC only.\nMessage: {message.content}"
-            mod = get_ai(mod_prompt)
+            reply = await get_ai(prompt, image=image)
 
-            if "TOXIC" in mod.upper():
-                await message.delete()
-                warns = add_warning(uid, gid)
-                if warns >= 3:
-                    set_punishment(uid, gid, "KICK")
-                    try:
-                        await message.author.send("You were kicked for repeated violations.")
-                    except:
-                        pass
-                    await message.guild.kick(message.author, reason="Auto-mod")
-                return
+        # update memory
+        new_memory = (memory + "\n" + message.content)[-1500:]
+        update_memory(uid, gid, new_memory)
 
-            reply = get_ai(message.content)
-            await message.reply(reply[:1900])
+        await message.reply(reply[:1900])
 
     await bot.process_commands(message)
 
-# Slash Command
+# -------------------------
+# ⚙️ SETUP COMMAND
+# -------------------------
 @bot.tree.command(name="setup")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ai_channels (guild_id, channel_id)
+        VALUES (?, ?)
+        ON CONFLICT(guild_id)
+        DO UPDATE SET channel_id=excluded.channel_id
+    """, (interaction.guild.id, channel.id))
+    conn.commit()
+    conn.close()
+
     ai_channels[interaction.guild.id] = channel.id
-    await interaction.response.send_message(f"✅ AI channel set to {channel.mention}", ephemeral=True)
+
+    await interaction.response.send_message(
+        f"AI channel set to {channel.mention}",
+        ephemeral=True
+    )
 
 # -------------------------
-# RUN BOT
+# 🚀 RUN BOT
 # -------------------------
 if __name__ == "__main__":
-    print("=== StarGPT Starting ===")
-    print(f"GEMINI_API_KEY : {'✅' if GEMINI_API_KEY else '❌ MISSING'}")
-    print(f"GROQ_API_KEY   : {'✅' if GROQ_API_KEY else '❌ MISSING'}")
-    print(f"DISCORD_TOKEN  : {'✅' if DISCORD_TOKEN else '❌ MISSING'}")
+    print("Starting StarGPT v2...")
 
     if not DISCORD_TOKEN:
-        print("❌ CRITICAL ERROR: DISCORD_TOKEN is missing!")
+        print("Missing DISCORD_TOKEN")
         exit(1)
 
-    print("🚀 Starting Bot...")
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    bot.run(DISCORD_TOKEN)
